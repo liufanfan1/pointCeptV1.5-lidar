@@ -1,5 +1,15 @@
 #!/usr/bin/env python
-"""Export transmission-line segmentation predictions to visualizable PLY files."""
+"""Export Stage-1 transmission-line 4-class predictions to PLY."""
+
+# stage1 专用PLY导出脚本
+
+
+""" 
+0 ground            灰色
+1 tower_structure   红色
+2 line              蓝色
+3 other             紫色
+"""
 
 import argparse
 from pathlib import Path
@@ -8,14 +18,12 @@ import numpy as np
 import torch
 
 
-CLASS_NAMES = ("ground", "tower", "line", "insulator", "hengdan", "other")
-TRANSMISSION_LINE_PALETTE = np.array(
+CLASS_NAMES = ("ground", "tower_structure", "line", "other")
+STAGE1_PALETTE = np.array(
     [
         [142, 142, 142],  # ground
-        [214, 39, 40],  # tower
+        [214, 39, 40],  # tower_structure
         [31, 119, 180],  # line
-        [255, 127, 14],  # insulator
-        [44, 160, 44],  # hengdan
         [148, 103, 189],  # other
     ],
     dtype=np.uint8,
@@ -32,7 +40,7 @@ CORRECT_PALETTE = np.array(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Convert Pointcept transmission-line *_pred.npy results and matching "
+            "Convert Stage-1 transmission-line *_pred.npy results and matching "
             ".pth point tiles to PLY point clouds."
         )
     )
@@ -45,8 +53,8 @@ def parse_args():
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("data/transmission_line"),
-        help="Pointcept transmission-line data root.",
+        default=Path("data/transmission_line_stage1_4cls_balance"),
+        help="Stage-1 Pointcept data root.",
     )
     parser.add_argument(
         "--split",
@@ -100,7 +108,7 @@ def collect_pred_paths(paths):
     return pred_paths
 
 
-def scene_name_from_pred(pred_path):
+def tile_name_from_pred(pred_path):
     return pred_path.name[: -len("_pred.npy")]
 
 
@@ -119,8 +127,8 @@ def load_tile(tile_path):
 
 def color_by_label(label):
     color = np.zeros((label.shape[0], 3), dtype=np.uint8)
-    valid = (label >= 0) & (label < len(TRANSMISSION_LINE_PALETTE))
-    color[valid] = TRANSMISSION_LINE_PALETTE[label[valid]]
+    valid = (label >= 0) & (label < len(STAGE1_PALETTE))
+    color[valid] = STAGE1_PALETTE[label[valid]]
     color[~valid] = [0, 0, 0]
     return color
 
@@ -187,19 +195,6 @@ def ply_header(point_count, ascii_format):
     )
 
 
-def write_ply(path, coord, color, pred, label, ascii_format):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = ply_header(coord.shape[0], ascii_format)
-    if ascii_format:
-        with path.open("w", encoding="utf-8") as file:
-            file.write(header)
-            write_vertices(file, coord, color, pred, label, ascii_format=True)
-    else:
-        with path.open("wb") as file:
-            file.write(header.encode("ascii"))
-            write_vertices(file, coord, color, pred, label, ascii_format=False)
-
-
 def write_vertices(file, coord, color, pred, label, ascii_format):
     vertices = vertex_array(coord, color, pred, label)
     if ascii_format:
@@ -221,6 +216,19 @@ def write_vertices(file, coord, color, pred, label, ascii_format):
         vertices.tofile(file)
 
 
+def write_ply(path, coord, color, pred, label, ascii_format):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "w" if ascii_format else "wb"
+    encoding = "utf-8" if ascii_format else None
+    with path.open(mode, encoding=encoding) as file:
+        header = ply_header(coord.shape[0], ascii_format)
+        if ascii_format:
+            file.write(header)
+        else:
+            file.write(header.encode("ascii"))
+        write_vertices(file, coord, color, pred, label, ascii_format)
+
+
 def output_path_for(pred_path, out, multiple):
     if out is None:
         return pred_path.with_suffix(".ply")
@@ -230,8 +238,8 @@ def output_path_for(pred_path, out, multiple):
 
 
 def load_prediction(pred_path, args):
-    scene_name = scene_name_from_pred(pred_path)
-    tile_path = args.data_root / args.split / f"{scene_name}.pth"
+    tile_name = tile_name_from_pred(pred_path)
+    tile_path = args.data_root / args.split / f"{tile_name}.pth"
     if not tile_path.exists():
         raise FileNotFoundError(f"Missing matching point tile: {tile_path}")
 
@@ -297,14 +305,30 @@ def main():
 if __name__ == "__main__":
     main()
 
-
+# 使用说明：
 """ 
-/opt/conda/envs/pointcept/bin/python tools/export_transmission_line_pred_ply.py \
-  /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission/two_stage_infer_scope_ts/result \
-  --data-root data/transmission_line \
+导出全部stage1测试结果
+cd /24085403037/PointTransformerV3/Pointcept-v1.5.1
+
+/opt/conda/envs/pointcept/bin/python tools/export_transmission_line_stage1_pred_ply.py \
+  exp/transmission/stage1_4cls_balance_w8_clean/result \
+  --data-root data/transmission_line_stage1_4cls_balance \
   --split test \
-  --out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_ply/two_stage_infer/result_ply \
-  --merge-out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_plytwo_stage_infer/two_stage_test_pred.ply \
+  --out exp/transmission/stage1_4cls_balance_w8_clean/stage1_result_ply \
+  --merge-out exp/transmission/stage1_4cls_balance_w8_clean/stage1_test_pred.ply \
   --color pred \
-  --world-coord
+  --world-coord 
+
+  
+ 看预测对错，其中 绿色是预测正确，红色是预测错误
+ /opt/conda/envs/pointcept/bin/python tools/export_transmission_line_stage1_pred_ply.py \
+  exp/transmission/stage1_4cls_balance_w8_clean/result \
+  --data-root data/transmission_line_stage1_4cls_balance \
+  --split test \
+  --out exp/transmission/stage1_4cls_balance_w8_clean/stage1_correct_ply \
+  --merge-out exp/transmission/stage1_4cls_balance_w8_clean/stage1_test_correct.ply \
+  --color correct \
+  --world-coord 
+  
+  
 """

@@ -7,6 +7,7 @@ Please cite our work if the code is helpful to you.
 
 import os
 import time
+import json
 import numpy as np
 from collections import OrderedDict
 import torch
@@ -29,6 +30,122 @@ from pointcept.utils.misc import (
 
 
 TESTERS = Registry("testers")
+
+
+def scene_name_from_data_name(data_name):
+    if "_tile" in data_name:
+        return data_name.split("_tile", 1)[0]
+    return data_name
+
+
+def sync_cuda():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def reset_cuda_peak():
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+
+def cuda_memory_stats():
+    if not torch.cuda.is_available():
+        return None
+    mib = 1024**2
+    return dict(
+        allocated_mb=round(torch.cuda.memory_allocated() / mib, 2),
+        reserved_mb=round(torch.cuda.memory_reserved() / mib, 2),
+        max_allocated_mb=round(torch.cuda.max_memory_allocated() / mib, 2),
+        max_reserved_mb=round(torch.cuda.max_memory_reserved() / mib, 2),
+    )
+
+
+def format_cuda_memory(stats):
+    if stats is None:
+        return "gpu_mem=n/a"
+    return (
+        "gpu_mem="
+        f"alloc={stats['allocated_mb']:.2f}MiB "
+        f"reserved={stats['reserved_mb']:.2f}MiB "
+        f"peak_alloc={stats['max_allocated_mb']:.2f}MiB "
+        f"peak_reserved={stats['max_reserved_mb']:.2f}MiB"
+    )
+
+
+def summarize_semseg_runtime(runtime_record, total_elapsed_sec):
+    scene_stats = OrderedDict()
+    peak_memory = None
+    inferred_tiles = 0
+    cached_tiles = 0
+    total_inference_elapsed_sec = 0.0
+
+    for item in runtime_record.values():
+        scene_name = item["scene"]
+        if scene_name not in scene_stats:
+            scene_stats[scene_name] = dict(
+                scene=scene_name,
+                tile_count=0,
+                inferred_tile_count=0,
+                cached_tile_count=0,
+                total_inference_elapsed_sec=0.0,
+                avg_inference_elapsed_sec=0.0,
+                total_wall_elapsed_sec=0.0,
+                avg_wall_elapsed_sec=0.0,
+            )
+
+        scene_item = scene_stats[scene_name]
+        scene_item["tile_count"] += 1
+        scene_item["total_wall_elapsed_sec"] += float(item["wall_elapsed_sec"])
+        if item["cached_pred"]:
+            cached_tiles += 1
+            scene_item["cached_tile_count"] += 1
+        else:
+            inferred_tiles += 1
+            scene_item["inferred_tile_count"] += 1
+            inference_elapsed_sec = float(item["inference_elapsed_sec"])
+            total_inference_elapsed_sec += inference_elapsed_sec
+            scene_item["total_inference_elapsed_sec"] += inference_elapsed_sec
+
+        memory = item.get("cuda_memory")
+        if memory is not None:
+            if peak_memory is None:
+                peak_memory = memory.copy()
+            else:
+                for key, value in memory.items():
+                    peak_memory[key] = max(
+                        float(peak_memory.get(key, 0.0)), float(value)
+                    )
+
+    for scene_item in scene_stats.values():
+        tile_count = max(scene_item["tile_count"], 1)
+        inferred_tile_count = max(scene_item["inferred_tile_count"], 1)
+        scene_item["total_inference_elapsed_sec"] = round(
+            scene_item["total_inference_elapsed_sec"], 4
+        )
+        scene_item["avg_inference_elapsed_sec"] = round(
+            scene_item["total_inference_elapsed_sec"] / inferred_tile_count, 4
+        )
+        scene_item["total_wall_elapsed_sec"] = round(
+            scene_item["total_wall_elapsed_sec"], 4
+        )
+        scene_item["avg_wall_elapsed_sec"] = round(
+            scene_item["total_wall_elapsed_sec"] / tile_count, 4
+        )
+
+    return dict(
+        total_elapsed_sec=round(total_elapsed_sec, 4),
+        total_inference_elapsed_sec=round(total_inference_elapsed_sec, 4),
+        avg_inference_elapsed_sec=(
+            round(total_inference_elapsed_sec / inferred_tiles, 4)
+            if inferred_tiles
+            else 0.0
+        ),
+        tile_count=len(runtime_record),
+        inferred_tile_count=inferred_tiles,
+        cached_tile_count=cached_tiles,
+        cuda_memory_peak=peak_memory,
+        scenes=list(scene_stats.values()),
+    )
 
 
 class TesterBase:
@@ -157,15 +274,21 @@ class SemSegTester(TesterBase):
                 json.dump(submission, f, indent=4)
         comm.synchronize()
         record = {}
+        runtime_record = {}
+        run_start = time.perf_counter()
         # fragment inference
         for idx, data_dict in enumerate(self.test_loader):
             end = time.time()
+            tile_wall_start = time.perf_counter()
+            inference_elapsed_sec = 0.0
+            memory_stats = None
             data_dict = data_dict[0]  # current assume batch size is 1
             fragment_list = data_dict.pop("fragment_list")
             segment = data_dict.pop("segment")
             data_name = data_dict.pop("name")
             pred_save_path = os.path.join(save_path, "{}_pred.npy".format(data_name))
-            if os.path.isfile(pred_save_path):
+            cached_pred = os.path.isfile(pred_save_path)
+            if cached_pred:
                 logger.info(
                     "{}/{}: {}, loaded pred and label.".format(
                         idx + 1, len(self.test_loader), data_name
@@ -173,6 +296,9 @@ class SemSegTester(TesterBase):
                 )
                 pred = np.load(pred_save_path)
             else:
+                reset_cuda_peak()
+                sync_cuda()
+                inference_start = time.perf_counter()
                 pred = torch.zeros((segment.size, self.cfg.data.num_classes)).cuda()
                 for i in range(len(fragment_list)):
                     fragment_batch_size = 1
@@ -205,6 +331,9 @@ class SemSegTester(TesterBase):
                     )
                 pred = pred.max(1)[1].data.cpu().numpy()
                 np.save(pred_save_path, pred)
+                sync_cuda()
+                inference_elapsed_sec = time.perf_counter() - inference_start
+                memory_stats = cuda_memory_stats()
             if "origin_segment" in data_dict.keys():
                 assert "inverse" in data_dict.keys()
                 pred = pred[data_dict["inverse"]]
@@ -217,6 +346,18 @@ class SemSegTester(TesterBase):
             target_meter.update(target)
             record[data_name] = dict(
                 intersection=intersection, union=union, target=target
+            )
+            tile_wall_elapsed_sec = time.perf_counter() - tile_wall_start
+            runtime_record[data_name] = dict(
+                tile=data_name,
+                scene=scene_name_from_data_name(data_name),
+                rank=comm.get_rank(),
+                points=int(segment.size),
+                fragment_count=len(fragment_list),
+                cached_pred=bool(cached_pred),
+                inference_elapsed_sec=round(inference_elapsed_sec, 4),
+                wall_elapsed_sec=round(tile_wall_elapsed_sec, 4),
+                cuda_memory=memory_stats,
             )
 
             mask = union != 0
@@ -231,6 +372,8 @@ class SemSegTester(TesterBase):
             logger.info(
                 "Test: {} [{}/{}]-{} "
                 "Batch {batch_time.val:.3f} ({batch_time.avg:.3f}) "
+                "Infer {infer_time:.3f}s Wall {wall_time:.3f}s "
+                "CachedPred {cached_pred} {gpu_mem} "
                 "Accuracy {acc:.4f} ({m_acc:.4f}) "
                 "mIoU {iou:.4f} ({m_iou:.4f})".format(
                     data_name,
@@ -238,6 +381,10 @@ class SemSegTester(TesterBase):
                     len(self.test_loader),
                     segment.size,
                     batch_time=batch_time,
+                    infer_time=inference_elapsed_sec,
+                    wall_time=tile_wall_elapsed_sec,
+                    cached_pred=cached_pred,
+                    gpu_mem=format_cuda_memory(memory_stats),
                     acc=acc,
                     m_acc=m_acc,
                     iou=iou,
@@ -289,7 +436,12 @@ class SemSegTester(TesterBase):
 
         logger.info("Syncing ...")
         comm.synchronize()
+        total_elapsed_sec = time.perf_counter() - run_start
         record_sync = comm.gather(record, dst=0)
+        runtime_record_sync = comm.gather(
+            dict(runtime_record=runtime_record, total_elapsed_sec=total_elapsed_sec),
+            dst=0,
+        )
 
         if comm.is_main_process():
             record = {}
@@ -297,6 +449,38 @@ class SemSegTester(TesterBase):
                 r = record_sync.pop()
                 record.update(r)
                 del r
+            runtime_record = {}
+            total_elapsed_sec = 0.0
+            for _ in range(len(runtime_record_sync)):
+                r = runtime_record_sync.pop()
+                runtime_record.update(r["runtime_record"])
+                total_elapsed_sec = max(total_elapsed_sec, r["total_elapsed_sec"])
+                del r
+            runtime_summary = summarize_semseg_runtime(
+                runtime_record, total_elapsed_sec
+            )
+            runtime_summary_path = os.path.join(
+                save_path, "inference_runtime_summary.json"
+            )
+            with open(runtime_summary_path, "w", encoding="utf-8") as f:
+                json.dump(
+                    dict(summary=runtime_summary, tiles=runtime_record),
+                    f,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            logger.info(
+                "Runtime summary: total_elapsed {:.3f}s, total_inference {:.3f}s, "
+                "avg_inference {:.3f}s, inferred_tiles {}, cached_tiles {}, peak {}".format(
+                    runtime_summary["total_elapsed_sec"],
+                    runtime_summary["total_inference_elapsed_sec"],
+                    runtime_summary["avg_inference_elapsed_sec"],
+                    runtime_summary["inferred_tile_count"],
+                    runtime_summary["cached_tile_count"],
+                    format_cuda_memory(runtime_summary["cuda_memory_peak"]),
+                )
+            )
+            logger.info(f"Runtime summary saved to: {runtime_summary_path}")
             intersection = np.sum(
                 [meters["intersection"] for _, meters in record.items()], axis=0
             )

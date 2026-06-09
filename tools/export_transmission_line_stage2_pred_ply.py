@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Export transmission-line segmentation predictions to visualizable PLY files."""
+"""Export Stage-2 transmission-line 4-class predictions to PLY."""
 
 import argparse
 from pathlib import Path
@@ -8,15 +8,13 @@ import numpy as np
 import torch
 
 
-CLASS_NAMES = ("ground", "tower", "line", "insulator", "hengdan", "other")
-TRANSMISSION_LINE_PALETTE = np.array(
+CLASS_NAMES = ("tower", "insulator", "hengdan", "background")
+STAGE2_PALETTE = np.array(
     [
-        [142, 142, 142],  # ground
         [214, 39, 40],  # tower
-        [31, 119, 180],  # line
         [255, 127, 14],  # insulator
         [44, 160, 44],  # hengdan
-        [148, 103, 189],  # other
+        [142, 142, 142],  # background
     ],
     dtype=np.uint8,
 )
@@ -32,8 +30,8 @@ CORRECT_PALETTE = np.array(
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Convert Pointcept transmission-line *_pred.npy results and matching "
-            ".pth point tiles to PLY point clouds."
+            "Convert Stage-2 transmission-line *_pred.npy results and matching "
+            ".pth ROI tiles to PLY point clouds."
         )
     )
     parser.add_argument(
@@ -45,13 +43,13 @@ def parse_args():
     parser.add_argument(
         "--data-root",
         type=Path,
-        default=Path("data/transmission_line"),
-        help="Pointcept transmission-line data root.",
+        default=Path("data/transmission_line_stage2_tower_ins_centered"),
+        help="Stage-2 Pointcept data root.",
     )
     parser.add_argument(
         "--split",
         default="test",
-        help="Dataset split containing the matching .pth files.",
+        help="Dataset split containing matching .pth ROI files.",
     )
     parser.add_argument(
         "--out",
@@ -72,9 +70,17 @@ def parse_args():
         help="PLY RGB source: predicted class, ground-truth label, original RGB, or correctness.",
     )
     parser.add_argument(
+        "--drop-background",
+        action="store_true",
+        help=(
+            "Drop background points before writing PLY. For color=pred this drops "
+            "predicted background; for color=label/correct this drops label background."
+        ),
+    )
+    parser.add_argument(
         "--world-coord",
         action="store_true",
-        help="Add the saved scene origin back to tile-local coordinates when available.",
+        help="Add the saved scene origin back to ROI-local coordinates when available.",
     )
     parser.add_argument(
         "--ascii",
@@ -100,7 +106,7 @@ def collect_pred_paths(paths):
     return pred_paths
 
 
-def scene_name_from_pred(pred_path):
+def tile_name_from_pred(pred_path):
     return pred_path.name[: -len("_pred.npy")]
 
 
@@ -119,8 +125,8 @@ def load_tile(tile_path):
 
 def color_by_label(label):
     color = np.zeros((label.shape[0], 3), dtype=np.uint8)
-    valid = (label >= 0) & (label < len(TRANSMISSION_LINE_PALETTE))
-    color[valid] = TRANSMISSION_LINE_PALETTE[label[valid]]
+    valid = (label >= 0) & (label < len(STAGE2_PALETTE))
+    color[valid] = STAGE2_PALETTE[label[valid]]
     color[~valid] = [0, 0, 0]
     return color
 
@@ -137,6 +143,14 @@ def choose_color(mode, pred, label, original_color):
         color[~valid] = [80, 80, 80]
         return color.astype(np.uint8)
     return original_color.astype(np.uint8, copy=False)
+
+
+def keep_mask_for_args(args, pred, label):
+    if not args.drop_background:
+        return np.ones(pred.shape[0], dtype=bool)
+    if args.color == "pred":
+        return pred != 3
+    return label != 3
 
 
 def vertex_array(coord, color, pred, label):
@@ -187,19 +201,6 @@ def ply_header(point_count, ascii_format):
     )
 
 
-def write_ply(path, coord, color, pred, label, ascii_format):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    header = ply_header(coord.shape[0], ascii_format)
-    if ascii_format:
-        with path.open("w", encoding="utf-8") as file:
-            file.write(header)
-            write_vertices(file, coord, color, pred, label, ascii_format=True)
-    else:
-        with path.open("wb") as file:
-            file.write(header.encode("ascii"))
-            write_vertices(file, coord, color, pred, label, ascii_format=False)
-
-
 def write_vertices(file, coord, color, pred, label, ascii_format):
     vertices = vertex_array(coord, color, pred, label)
     if ascii_format:
@@ -221,6 +222,19 @@ def write_vertices(file, coord, color, pred, label, ascii_format):
         vertices.tofile(file)
 
 
+def write_ply(path, coord, color, pred, label, ascii_format):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "w" if ascii_format else "wb"
+    encoding = "utf-8" if ascii_format else None
+    with path.open(mode, encoding=encoding) as file:
+        header = ply_header(coord.shape[0], ascii_format)
+        if ascii_format:
+            file.write(header)
+        else:
+            file.write(header.encode("ascii"))
+        write_vertices(file, coord, color, pred, label, ascii_format)
+
+
 def output_path_for(pred_path, out, multiple):
     if out is None:
         return pred_path.with_suffix(".ply")
@@ -230,10 +244,10 @@ def output_path_for(pred_path, out, multiple):
 
 
 def load_prediction(pred_path, args):
-    scene_name = scene_name_from_pred(pred_path)
-    tile_path = args.data_root / args.split / f"{scene_name}.pth"
+    tile_name = tile_name_from_pred(pred_path)
+    tile_path = args.data_root / args.split / f"{tile_name}.pth"
     if not tile_path.exists():
-        raise FileNotFoundError(f"Missing matching point tile: {tile_path}")
+        raise FileNotFoundError(f"Missing matching Stage-2 ROI tile: {tile_path}")
 
     pred = np.load(pred_path).astype(np.int32).reshape(-1)
     coord, original_color, label, origin = load_tile(tile_path)
@@ -245,18 +259,28 @@ def load_prediction(pred_path, args):
     if args.world_coord:
         coord = coord + origin.reshape(1, 3)
 
+    keep = keep_mask_for_args(args, pred, label)
+    coord = coord[keep]
+    original_color = original_color[keep]
+    pred = pred[keep]
+    label = label[keep]
     color = choose_color(args.color, pred, label, original_color)
     return coord, color, pred, label
 
 
-def prediction_point_count(pred_path):
-    pred = np.load(pred_path, mmap_mode="r")
-    return int(np.prod(pred.shape))
+def prediction_point_count(pred_path, args):
+    if not args.drop_background:
+        pred = np.load(pred_path, mmap_mode="r")
+        return int(np.prod(pred.shape))
+    coord, _, _, _ = load_prediction(pred_path, args)
+    return int(coord.shape[0])
 
 
 def write_merged_ply(path, pred_paths, args):
     path.parent.mkdir(parents=True, exist_ok=True)
-    point_count = sum(prediction_point_count(pred_path) for pred_path in pred_paths)
+    point_count = sum(
+        prediction_point_count(pred_path, args) for pred_path in pred_paths
+    )
     header = ply_header(point_count, args.ascii)
     mode = "w" if args.ascii else "wb"
     encoding = "utf-8" if args.ascii else None
@@ -296,15 +320,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-""" 
-/opt/conda/envs/pointcept/bin/python tools/export_transmission_line_pred_ply.py \
-  /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission/two_stage_infer_scope_ts/result \
-  --data-root data/transmission_line \
-  --split test \
-  --out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_ply/two_stage_infer/result_ply \
-  --merge-out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_plytwo_stage_infer/two_stage_test_pred.ply \
-  --color pred \
-  --world-coord
-"""
