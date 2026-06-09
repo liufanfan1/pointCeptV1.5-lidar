@@ -1,16 +1,51 @@
-image/
-__pycache__
-**/build/
-**/*.egg-info/
-**/dist/
+# Python cache / bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
 *.so
-exp
-weights
-data
-log
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# IDE / OS files
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and runtime outputs
+*.log
+*.out
+log/
+logs/
 outputs/
-.vscode
-.idea
-*/.DS_Store
-**/*.out
-Dockerfile
+runs/
+wandb/
+
+# Pointcept datasets, checkpoints, and experiment outputs
+data/
+exp/
+pretrained/
+weights/
+
+# Large point-cloud / model / prediction artifacts
+*.pth
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.ply
+*.las
+*.laz
+*.bin
+
+# Generated images or local notes
+image/

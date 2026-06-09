@@ -1,0 +1,319 @@
+"""
+Preprocess classified transmission-line LAS scenes for Pointcept.
+
+Each source scene contains one LAS file per semantic class, e.g.
+``0_ground.las`` and ``2_line.las``. The script merges class files into
+spatial tiles while preserving labels in ``semantic_gt``.
+"""
+
+import argparse
+import json
+import re
+import struct
+from pathlib import Path
+
+import numpy as np
+import torch
+
+
+CLASS_NAMES = ("ground", "tower", "line", "insulator", "hengdan", "other")
+CLASS_REMAP = {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 5}
+FILE_PATTERN = re.compile(r"^(\d+)[_-](.+)\.las$", re.IGNORECASE)
+SCENE_PATTERN = re.compile(r"^scene(\d+)$", re.IGNORECASE)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Convert classified transmission-line LAS scenes to Pointcept .pth tiles."
+    )
+    parser.add_argument("--dataset-root", required=True, help="Directory containing Scene*/ folders.")
+    parser.add_argument("--output-root", required=True, help="Output Pointcept data directory.")
+    parser.add_argument(
+        "--voxel-size",
+        type=float,
+        default=0.02,
+        help="Class-preserving voxel sampling size in metres. Set 0 to disable.",
+    )
+    parser.add_argument(
+        "--tile-size",
+        type=float,
+        default=50.0,
+        help="XY tile width and height in metres. Set 0 to save one tile per scene.",
+    )
+    parser.add_argument(
+        "--train-tile-stride",
+        type=float,
+        default=50.0,
+        help="Training tile stride in metres; set below tile size to add overlap.",
+    )
+    parser.add_argument(
+        "--eval-tile-stride",
+        type=float,
+        default=50.0,
+        help="Validation/test tile stride in metres.",
+    )
+    parser.add_argument(
+        "--scene",
+        action="append",
+        default=None,
+        help="Only convert a named scene; repeat for several scenes. Useful for checking output.",
+    )
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output tiles.")
+    return parser.parse_args()
+
+
+def read_header(path):
+    with path.open("rb") as file:
+        header = file.read(375)
+    if header[:4] != b"LASF":
+        raise ValueError(f"Not a LAS file: {path}")
+    version = (header[24], header[25])
+    if version > (1, 4):
+        raise ValueError(f"Unsupported LAS version {version[0]}.{version[1]}: {path}")
+    header_size = struct.unpack_from("<H", header, 94)[0]
+    point_offset = struct.unpack_from("<I", header, 96)[0]
+    point_format = header[104] & 0x3F
+    record_length = struct.unpack_from("<H", header, 105)[0]
+    point_count = struct.unpack_from("<I", header, 107)[0]
+    if point_count == 0 and header_size >= 375:
+        point_count = struct.unpack_from("<Q", header, 247)[0]
+    scale = np.array(struct.unpack_from("<3d", header, 131), dtype=np.float64)
+    offset = np.array(struct.unpack_from("<3d", header, 155), dtype=np.float64)
+    maximum = np.array(
+        [struct.unpack_from("<d", header, pos)[0] for pos in (179, 195, 211)],
+        dtype=np.float64,
+    )
+    minimum = np.array(
+        [struct.unpack_from("<d", header, pos)[0] for pos in (187, 203, 219)],
+        dtype=np.float64,
+    )
+    return dict(
+        version=version,
+        point_offset=point_offset,
+        point_format=point_format,
+        record_length=record_length,
+        point_count=point_count,
+        scale=scale,
+        offset=offset,
+        minimum=minimum,
+        maximum=maximum,
+    )
+
+
+def read_points(path, origin):
+    header = read_header(path)
+    point_format = header["point_format"]
+    if point_format not in (0, 1, 2, 3):
+        raise ValueError(f"Unsupported LAS point format {point_format}: {path}")
+    count = header["point_count"]
+    record_length = header["record_length"]
+    raw = np.memmap(
+        path,
+        dtype=np.uint8,
+        mode="r",
+        offset=header["point_offset"],
+        shape=(count * record_length,),
+    )
+    xyz_integer = np.stack(
+        [
+            np.ndarray((count,), dtype="<i4", buffer=raw, offset=i * 4, strides=(record_length,))
+            for i in range(3)
+        ],
+        axis=1,
+    )
+    coord = xyz_integer.astype(np.float64) * header["scale"] + header["offset"] - origin
+    if point_format == 2:
+        color_offset = 20
+    elif point_format == 3:
+        color_offset = 28
+    else:
+        color_offset = None
+    if color_offset is None:
+        color = np.zeros((count, 3), dtype=np.uint8)
+    else:
+        color_16 = np.stack(
+            [
+                np.ndarray(
+                    (count,),
+                    dtype="<u2",
+                    buffer=raw,
+                    offset=color_offset + i * 2,
+                    strides=(record_length,),
+                )
+                for i in range(3)
+            ],
+            axis=1,
+        )
+        if color_16.max(initial=0) > 255:
+            color = (color_16 >> 8).astype(np.uint8)
+        else:
+            color = color_16.astype(np.uint8)
+    return coord, color
+
+
+def natural_scene_key(path):
+    match = SCENE_PATTERN.match(path.name)
+    return int(match.group(1)) if match else path.name.lower()
+
+
+def scene_number(scene_path):
+    match = SCENE_PATTERN.match(scene_path.name)
+    if match is None:
+        raise ValueError(f"Scene directory must be named scene<number>: {scene_path}")
+    return int(match.group(1))
+
+
+def split_for_scene(number):
+    if number <= 40:
+        return "train"
+    if number <= 48:
+        return "val"
+    return "test"
+
+
+def tile_starts(extent, tile_size, stride):
+    if tile_size <= 0:
+        return [0.0]
+    # Edge tiles may be smaller; this prevents an almost duplicate final tile.
+    return list(np.arange(0.0, max(extent, 1e-9), stride))
+
+
+def voxel_select(coord, voxel_size):
+    if voxel_size <= 0 or coord.shape[0] == 0:
+        return np.arange(coord.shape[0])
+    grid_coord = np.floor(coord / voxel_size).astype(np.int64)
+    _, index = np.unique(grid_coord, axis=0, return_index=True)
+    return np.sort(index)
+
+
+def scene_class_files(scene_path):
+    files = []
+    for path in sorted(scene_path.glob("*.las")):
+        match = FILE_PATTERN.match(path.name)
+        if match is None:
+            raise ValueError(f"Unexpected LAS filename: {path}")
+        source_label = int(match.group(1))
+        if source_label not in CLASS_REMAP:
+            raise ValueError(f"Unsupported semantic label {source_label}: {path}")
+        files.append((path, CLASS_REMAP[source_label]))
+    if not files:
+        raise ValueError(f"No LAS class files found in {scene_path}")
+    return files
+
+
+def convert_scene(scene_path, output_root, args):
+    number = scene_number(scene_path)
+    split = split_for_scene(number)
+    class_files = scene_class_files(scene_path)
+    headers = [read_header(path) for path, _ in class_files]
+    origin = np.min(np.stack([item["minimum"] for item in headers]), axis=0)
+    maximum = np.max(np.stack([item["maximum"] for item in headers]), axis=0)
+    extent = maximum - origin
+    stride = args.train_tile_stride if split == "train" else args.eval_tile_stride
+    x_starts = tile_starts(extent[0], args.tile_size, stride)
+    y_starts = tile_starts(extent[1], args.tile_size, stride)
+    tiles = [
+        dict(coord=[], color=[], semantic_gt=[], bounds=(x, y))
+        for x in x_starts
+        for y in y_starts
+    ]
+
+    source_counts = np.zeros(len(CLASS_NAMES), dtype=np.int64)
+    saved_counts = np.zeros(len(CLASS_NAMES), dtype=np.int64)
+    for path, label in class_files:
+        coord, color = read_points(path, origin)
+        source_counts[label] += coord.shape[0]
+        for tile in tiles:
+            x, y = tile["bounds"]
+            if args.tile_size > 0:
+                mask = (
+                    (coord[:, 0] >= x)
+                    & (coord[:, 0] <= x + args.tile_size)
+                    & (coord[:, 1] >= y)
+                    & (coord[:, 1] <= y + args.tile_size)
+                )
+                tile_coord = coord[mask]
+                tile_color = color[mask]
+            else:
+                tile_coord = coord
+                tile_color = color
+            index = voxel_select(tile_coord, args.voxel_size)
+            if index.size == 0:
+                continue
+            tile["coord"].append(tile_coord[index].astype(np.float32))
+            tile["color"].append(tile_color[index])
+            tile["semantic_gt"].append(np.full(index.size, label, dtype=np.int64))
+            saved_counts[label] += index.size
+
+    split_path = output_root / split
+    split_path.mkdir(parents=True, exist_ok=True)
+    tile_count = 0
+    for tile_id, tile in enumerate(tiles):
+        if not tile["coord"]:
+            continue
+        output_path = split_path / f"scene{number:02d}_tile{tile_id:03d}.pth"
+        if output_path.exists() and not args.overwrite:
+            raise FileExistsError(f"Output exists; use --overwrite: {output_path}")
+        data = dict(
+            coord=np.concatenate(tile["coord"], axis=0),
+            color=np.concatenate(tile["color"], axis=0),
+            semantic_gt=np.concatenate(tile["semantic_gt"], axis=0),
+            origin=origin.astype(np.float64),
+            scene=f"scene{number:02d}",
+        )
+        torch.save(data, output_path)
+        tile_count += 1
+    return dict(
+        scene=f"scene{number:02d}",
+        split=split,
+        tiles=tile_count,
+        source_points=source_counts.tolist(),
+        saved_points=saved_counts.tolist(),
+        origin=origin.tolist(),
+    )
+
+
+def main():
+    args = parse_args()
+    dataset_root = Path(args.dataset_root)
+    output_root = Path(args.output_root)
+    scenes = sorted(
+        [path for path in dataset_root.iterdir() if path.is_dir()],
+        key=natural_scene_key,
+    )
+    if args.scene:
+        wanted = {name.lower() for name in args.scene}
+        scenes = [scene for scene in scenes if scene.name.lower() in wanted]
+    if not scenes:
+        raise ValueError("No matching scene directories found.")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary = []
+    for scene in scenes:
+        result = convert_scene(scene, output_root, args)
+        summary.append(result)
+        print(
+            "{scene} -> {split}: {tiles} tiles, {source:,} source points, {saved:,} saved points".format(
+                scene=result["scene"],
+                split=result["split"],
+                tiles=result["tiles"],
+                source=sum(result["source_points"]),
+                saved=sum(result["saved_points"]),
+            )
+        )
+    metadata = dict(
+        class_names=CLASS_NAMES,
+        source_label_remap=CLASS_REMAP,
+        voxel_size=args.voxel_size,
+        tile_size=args.tile_size,
+        train_tile_stride=args.train_tile_stride,
+        eval_tile_stride=args.eval_tile_stride,
+        scenes=summary,
+    )
+    with (output_root / "metadata.json").open("w", encoding="utf-8") as file:
+        json.dump(metadata, file, indent=2)
+    print(f"Saved metadata to {output_root / 'metadata.json'}")
+
+
+if __name__ == "__main__":
+    main()

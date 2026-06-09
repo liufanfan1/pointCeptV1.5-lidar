@@ -8,7 +8,8 @@ from .point_transformer_v2 import *
 from .point_transformer_v3 import *
 from .stratified_transformer import *
 from .spvcnn import *
-from .octformer import *
+# OctFormer requires extra ocnn/dwconv dependencies; PTv3 reproduction does not need it.
+# from .octformer import *
 
 # from .swin3d import *
 
@@ -16,7 +17,8 @@ from .octformer import *
 from .context_aware_classifier import *
 
 # Instance Segmentation
-from .point_group import *
+# PointGroup requires optional pointgroup_ops; not needed for PTv3 semantic segmentation.
+# from .point_group import *
 
 # Pretraining
 from .masked_scene_contrast import *

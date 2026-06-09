@@ -181,9 +181,18 @@ class Trainer(TrainerBase):
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
             output_dict = self.model(input_dict)
             loss = output_dict["loss"]
+        if not torch.isfinite(loss):
+            raise FloatingPointError(
+                f"Non-finite training loss detected at epoch {self.epoch + 1}. "
+                "Stopping before the optimizer state is corrupted."
+            )
+        grad_clip_norm = getattr(self.cfg, "grad_clip_norm", None)
         self.optimizer.zero_grad()
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
+            if grad_clip_norm is not None:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
             self.scaler.step(self.optimizer)
 
             # When enable amp, optimizer.step call are skipped if the loss scaling factor is too large.
@@ -194,6 +203,8 @@ class Trainer(TrainerBase):
                 self.scheduler.step()
         else:
             loss.backward()
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), grad_clip_norm)
             self.optimizer.step()
             self.scheduler.step()
         if self.cfg.empty_cache:
