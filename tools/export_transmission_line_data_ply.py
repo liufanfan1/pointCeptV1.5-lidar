@@ -12,10 +12,10 @@ CLASS_NAMES = ("ground", "tower", "line", "insulator", "hengdan", "other")
 TRANSMISSION_LINE_PALETTE = np.array(
     [
         [142, 142, 142],  # ground 灰色
-        [214, 39, 40],    # tower 红色
-        [31, 119, 180],   # line 蓝色
-        [255, 127, 14],   # insulator 橙色
-        [44, 160, 44],    # hengdan 绿色
+        [214, 39, 40],  # tower 红色
+        [31, 119, 180],  # line 蓝色
+        [255, 127, 14],  # insulator 橙色
+        [44, 160, 44],  # hengdan 绿色
         [148, 103, 189],  # other 紫色
     ],
     dtype=np.uint8,
@@ -209,7 +209,9 @@ def write_merged_ply(path, pth_paths, args):
             file.write(header.encode("ascii"))
         written = 0
         for pth_path in pth_paths:
-            coord, original_color, label = load_tile(pth_path, world_coord=args.world_coord)
+            coord, original_color, label = load_tile(
+                pth_path, world_coord=args.world_coord
+            )
             color = choose_color(args.color, label, original_color)
             write_vertices(file, coord, color, label, args.ascii)
             written += coord.shape[0]

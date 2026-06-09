@@ -14,6 +14,7 @@ DST_ROOT = Path("data/transmission_line_stage1_4cls_balance")
 # 2 line
 # 3 other
 
+
 def load_label(p):
     data = torch.load(p, map_location="cpu")
     y = data["semantic_gt"]
@@ -92,9 +93,9 @@ def main():
         print(f"{k}: {v}")
 
     print("\nOutput:", DST_ROOT)
-    print("train files:", len(list((DST_ROOT / 'train').glob('*.pth'))))
-    print("val files:", len(list((DST_ROOT / 'val').glob('*.pth'))))
-    print("test files:", len(list((DST_ROOT / 'test').glob('*.pth'))))
+    print("train files:", len(list((DST_ROOT / "train").glob("*.pth"))))
+    print("val files:", len(list((DST_ROOT / "val").glob("*.pth"))))
+    print("test files:", len(list((DST_ROOT / "test").glob("*.pth"))))
 
 
 if __name__ == "__main__":

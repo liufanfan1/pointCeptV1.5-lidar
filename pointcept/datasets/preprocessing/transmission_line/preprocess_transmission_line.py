@@ -28,8 +28,12 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Convert classified transmission-line LAS scenes to Pointcept .pth tiles."
     )
-    parser.add_argument("--dataset-root", required=True, help="Directory containing Scene*/ folders.")
-    parser.add_argument("--output-root", required=True, help="Output Pointcept data directory.")
+    parser.add_argument(
+        "--dataset-root", required=True, help="Directory containing Scene*/ folders."
+    )
+    parser.add_argument(
+        "--output-root", required=True, help="Output Pointcept data directory."
+    )
     parser.add_argument(
         "--voxel-size",
         type=float,
@@ -69,7 +73,9 @@ def parse_args():
         default=None,
         help="Only convert a named scene; repeat for several scenes. Useful for checking output.",
     )
-    parser.add_argument("--overwrite", action="store_true", help="Overwrite existing output tiles.")
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Overwrite existing output tiles."
+    )
     return parser.parse_args()
 
 
@@ -127,7 +133,13 @@ def read_points(path, origin):
     )
     xyz_integer = np.stack(
         [
-            np.ndarray((count,), dtype="<i4", buffer=raw, offset=i * 4, strides=(record_length,))
+            np.ndarray(
+                (count,),
+                dtype="<i4",
+                buffer=raw,
+                offset=i * 4,
+                strides=(record_length,),
+            )
             for i in range(3)
         ],
         axis=1,

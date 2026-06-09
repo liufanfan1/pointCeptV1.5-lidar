@@ -39,7 +39,9 @@ def copy_tree_split(split):
     print(f"{split}: copied {len(list(src.glob('*.pth')))} base files")
 
 
-def make_roi_from_old6(p, target_old_label, xy_margin, z_margin, min_target_points, suffix):
+def make_roi_from_old6(
+    p, target_old_label, xy_margin, z_margin, min_target_points, suffix
+):
     data = torch.load(p, map_location="cpu")
 
     coord = to_numpy(data["coord"]).astype(np.float32)
@@ -62,9 +64,12 @@ def make_roi_from_old6(p, target_old_label, xy_margin, z_margin, min_target_poin
     xyz_max[2] += z_margin
 
     roi_mask = (
-        (coord[:, 0] >= xyz_min[0]) & (coord[:, 0] <= xyz_max[0]) &
-        (coord[:, 1] >= xyz_min[1]) & (coord[:, 1] <= xyz_max[1]) &
-        (coord[:, 2] >= xyz_min[2]) & (coord[:, 2] <= xyz_max[2])
+        (coord[:, 0] >= xyz_min[0])
+        & (coord[:, 0] <= xyz_max[0])
+        & (coord[:, 1] >= xyz_min[1])
+        & (coord[:, 1] <= xyz_max[1])
+        & (coord[:, 2] >= xyz_min[2])
+        & (coord[:, 2] <= xyz_max[2])
     )
 
     if int(roi_mask.sum()) < 128:

@@ -12,18 +12,18 @@ CLASS_NAMES = ("ground", "tower", "line", "insulator", "hengdan", "other")
 TRANSMISSION_LINE_PALETTE = np.array(
     [
         [142, 142, 142],  # ground
-        [214, 39, 40],    # tower
-        [31, 119, 180],   # line
-        [255, 127, 14],   # insulator
-        [44, 160, 44],    # hengdan
+        [214, 39, 40],  # tower
+        [31, 119, 180],  # line
+        [255, 127, 14],  # insulator
+        [44, 160, 44],  # hengdan
         [148, 103, 189],  # other
     ],
     dtype=np.uint8,
 )
 CORRECT_PALETTE = np.array(
     [
-        [220, 53, 69],    # wrong
-        [40, 167, 69],    # correct
+        [220, 53, 69],  # wrong
+        [40, 167, 69],  # correct
     ],
     dtype=np.uint8,
 )
@@ -280,7 +280,9 @@ def main():
     pred_paths = collect_pred_paths(args.pred)
     multiple = len(pred_paths) > 1
     if multiple and args.out is not None and args.out.suffix:
-        raise ValueError("--out must be a directory when exporting multiple predictions.")
+        raise ValueError(
+            "--out must be a directory when exporting multiple predictions."
+        )
 
     for pred_path in pred_paths:
         coord, color, pred, label = load_prediction(pred_path, args)

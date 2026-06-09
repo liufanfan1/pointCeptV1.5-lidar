@@ -34,14 +34,17 @@ NEW_CLASS_NAMES = [
 ]
 
 # old label -> new label
-REMAP = np.array([
-    3,  # old 0 ground     -> new 3 background
-    0,  # old 1 tower      -> new 0 tower
-    3,  # old 2 line       -> new 3 background
-    1,  # old 3 insulator  -> new 1 insulator
-    2,  # old 4 hengdan    -> new 2 hengdan
-    3,  # old 5 other      -> new 3 background
-], dtype=np.int64)
+REMAP = np.array(
+    [
+        3,  # old 0 ground     -> new 3 background
+        0,  # old 1 tower      -> new 0 tower
+        3,  # old 2 line       -> new 3 background
+        1,  # old 3 insulator  -> new 1 insulator
+        2,  # old 4 hengdan    -> new 2 hengdan
+        3,  # old 5 other      -> new 3 background
+    ],
+    dtype=np.int64,
+)
 
 # 用于确定杆塔 ROI 的前景类别：tower + insulator + hengdan
 TARGET_OLD_LABELS = (1, 3, 4)
@@ -109,7 +112,9 @@ def crop_one_file(p, args):
     label_old = to_numpy(data["semantic_gt"]).astype(np.int64)
 
     if coord.shape[0] != label_old.shape[0]:
-        raise ValueError(f"Point count mismatch in {p}: coord={coord.shape}, label={label_old.shape}")
+        raise ValueError(
+            f"Point count mismatch in {p}: coord={coord.shape}, label={label_old.shape}"
+        )
 
     if label_old.min() < 0 or label_old.max() > 5:
         raise ValueError(
@@ -136,9 +141,12 @@ def crop_one_file(p, args):
     xyz_max[2] += args.z_margin
 
     roi_mask = (
-        (coord[:, 0] >= xyz_min[0]) & (coord[:, 0] <= xyz_max[0]) &
-        (coord[:, 1] >= xyz_min[1]) & (coord[:, 1] <= xyz_max[1]) &
-        (coord[:, 2] >= xyz_min[2]) & (coord[:, 2] <= xyz_max[2])
+        (coord[:, 0] >= xyz_min[0])
+        & (coord[:, 0] <= xyz_max[0])
+        & (coord[:, 1] >= xyz_min[1])
+        & (coord[:, 1] <= xyz_max[1])
+        & (coord[:, 2] >= xyz_min[2])
+        & (coord[:, 2] <= xyz_max[2])
     )
 
     if int(roi_mask.sum()) < args.min_points:
@@ -275,7 +283,9 @@ def main():
         if total == 0:
             continue
         for i, name in enumerate(NEW_CLASS_NAMES):
-            print(f"  {i} {name:12s}: {int(counts[i]):12d}, ratio={counts[i] / total:.6f}")
+            print(
+                f"  {i} {name:12s}: {int(counts[i]):12d}, ratio={counts[i] / total:.6f}"
+            )
 
 
 if __name__ == "__main__":

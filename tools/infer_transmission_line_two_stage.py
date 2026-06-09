@@ -47,7 +47,9 @@ def parse_args():
         default=Path("data/transmission_line"),
         help="Original 6-class Pointcept .pth dataset root.",
     )
-    parser.add_argument("--split", default="test", help="Dataset split under data-root.")
+    parser.add_argument(
+        "--split", default="test", help="Dataset split under data-root."
+    )
     parser.add_argument(
         "--input",
         type=Path,
@@ -63,7 +65,9 @@ def parse_args():
     parser.add_argument(
         "--stage1-weight",
         type=Path,
-        default=Path("exp/transmission/stage1_4cls_balance_w8_clean/model/model_best.pth"),
+        default=Path(
+            "exp/transmission/stage1_4cls_balance_w8_clean/model/model_best.pth"
+        ),
     )
     parser.add_argument(
         "--stage2-config",
@@ -73,7 +77,9 @@ def parse_args():
     parser.add_argument(
         "--stage2-weight",
         type=Path,
-        default=Path("exp/transmission/stage2_tower_ins_centered_w24/model/model_best.pth"),
+        default=Path(
+            "exp/transmission/stage2_tower_ins_centered_w24/model/model_best.pth"
+        ),
     )
     parser.add_argument(
         "--out",
@@ -81,8 +87,12 @@ def parse_args():
         default=Path("exp/transmission/two_stage_infer/result"),
         help="Output directory for final *_pred.npy files.",
     )
-    parser.add_argument("--xy-margin", type=float, default=8.0, help="Stage2 ROI XY margin in meters.")
-    parser.add_argument("--z-margin", type=float, default=3.0, help="Stage2 ROI Z margin in meters.")
+    parser.add_argument(
+        "--xy-margin", type=float, default=8.0, help="Stage2 ROI XY margin in meters."
+    )
+    parser.add_argument(
+        "--z-margin", type=float, default=3.0, help="Stage2 ROI Z margin in meters."
+    )
     parser.add_argument(
         "--min-stage1-target-points",
         type=int,
@@ -120,7 +130,9 @@ def parse_args():
         action="store_true",
         help="Recompute predictions even if final output already exists.",
     )
-    parser.add_argument("--device", default="cuda", help="Inference device, usually cuda.")
+    parser.add_argument(
+        "--device", default="cuda", help="Inference device, usually cuda."
+    )
     return parser.parse_args()
 
 
@@ -177,7 +189,9 @@ def load_tile(path):
     if segment is None:
         segment = np.full(coord.shape[0], -1, dtype=np.int64)
     else:
-        segment = numpy_or_default(data, "semantic_gt", None).astype(np.int64).reshape(-1)
+        segment = (
+            numpy_or_default(data, "semantic_gt", None).astype(np.int64).reshape(-1)
+        )
     if segment.shape[0] != coord.shape[0]:
         raise ValueError(f"{path} coord/semantic_gt point count mismatch.")
     return dict(coord=coord, color=color, segment=segment)
@@ -293,7 +307,9 @@ def collect_input_paths(args):
 
 def main():
     args = parse_args()
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
+    device = torch.device(
+        args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu"
+    )
     args.out.mkdir(parents=True, exist_ok=True)
     if args.save_intermediate:
         (args.out / "stage1").mkdir(parents=True, exist_ok=True)
@@ -314,23 +330,37 @@ def main():
             continue
 
         tile_data = load_tile(tile_path)
-        stage1_pred, _ = predict(stage1_model, stage1_cfg, stage1_pipeline, tile_data, device)
+        stage1_pred, _ = predict(
+            stage1_model, stage1_cfg, stage1_pipeline, tile_data, device
+        )
         roi_data, roi_mask, target_count = make_stage2_roi(tile_data, stage1_pred, args)
 
         stage2_pred = None
         stage2_conf = None
         roi_points = int(roi_mask.sum()) if roi_mask is not None else 0
         if roi_data is not None:
-            stage2_pred, stage2_conf = predict(stage2_model, stage2_cfg, stage2_pipeline, roi_data, device)
+            stage2_pred, stage2_conf = predict(
+                stage2_model, stage2_cfg, stage2_pipeline, roi_data, device
+            )
 
-        final_pred = fuse_predictions(stage1_pred, stage2_pred, stage2_conf, roi_mask, args)
+        final_pred = fuse_predictions(
+            stage1_pred, stage2_pred, stage2_conf, roi_mask, args
+        )
         np.save(out_path, final_pred.astype(np.int64))
 
         if args.save_intermediate:
-            np.save(args.out / "stage1" / f"{tile_path.stem}_stage1_pred.npy", stage1_pred)
+            np.save(
+                args.out / "stage1" / f"{tile_path.stem}_stage1_pred.npy", stage1_pred
+            )
             if stage2_pred is not None:
-                np.save(args.out / "stage2_roi" / f"{tile_path.stem}_stage2_roi_pred.npy", stage2_pred)
-                np.save(args.out / "stage2_roi" / f"{tile_path.stem}_stage2_roi_mask.npy", roi_mask)
+                np.save(
+                    args.out / "stage2_roi" / f"{tile_path.stem}_stage2_roi_pred.npy",
+                    stage2_pred,
+                )
+                np.save(
+                    args.out / "stage2_roi" / f"{tile_path.stem}_stage2_roi_mask.npy",
+                    roi_mask,
+                )
 
         counts = np.bincount(final_pred, minlength=6)
         item = dict(

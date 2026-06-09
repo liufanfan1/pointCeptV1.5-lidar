@@ -40,14 +40,17 @@ Original 6-class labels:
 CLASS_NAMES = ["tower", "insulator", "hengdan", "background"]
 
 # old 6-class label -> stage2 4-class label
-REMAP = np.array([
-    3,  # old 0 ground     -> background
-    0,  # old 1 tower      -> tower
-    3,  # old 2 line       -> background
-    1,  # old 3 insulator  -> insulator
-    2,  # old 4 hengdan    -> hengdan
-    3,  # old 5 other      -> background
-], dtype=np.int64)
+REMAP = np.array(
+    [
+        3,  # old 0 ground     -> background
+        0,  # old 1 tower      -> tower
+        3,  # old 2 line       -> background
+        1,  # old 3 insulator  -> insulator
+        2,  # old 4 hengdan    -> hengdan
+        3,  # old 5 other      -> background
+    ],
+    dtype=np.int64,
+)
 
 
 def parse_args():
@@ -168,9 +171,12 @@ def make_crop(data, center, xy_radius, z_radius):
     x, y, z = center
 
     mask = (
-        (coord[:, 0] >= x - xy_radius) & (coord[:, 0] <= x + xy_radius) &
-        (coord[:, 1] >= y - xy_radius) & (coord[:, 1] <= y + xy_radius) &
-        (coord[:, 2] >= z - z_radius) & (coord[:, 2] <= z + z_radius)
+        (coord[:, 0] >= x - xy_radius)
+        & (coord[:, 0] <= x + xy_radius)
+        & (coord[:, 1] >= y - xy_radius)
+        & (coord[:, 1] <= y + xy_radius)
+        & (coord[:, 2] >= z - z_radius)
+        & (coord[:, 2] <= z + z_radius)
     )
 
     if int(mask.sum()) == 0:
@@ -262,7 +268,9 @@ def main():
             raise ValueError(f"Point count mismatch in {p}")
 
         if old_label.min() < 0 or old_label.max() > 5:
-            raise ValueError(f"Bad label range in {p}: {old_label.min()} ~ {old_label.max()}")
+            raise ValueError(
+                f"Bad label range in {p}: {old_label.min()} ~ {old_label.max()}"
+            )
 
         # ----------------------------
         # 1. insulator-centered crops
@@ -395,12 +403,13 @@ def main():
         "added_hengdan_centered_crops": added_hengdan_crops,
         "skipped_hengdan_centered_crops": skipped_hengdan_crops,
         "added_crop_points": {
-            CLASS_NAMES[i]: int(total_added_counts[i])
-            for i in range(4)
+            CLASS_NAMES[i]: int(total_added_counts[i]) for i in range(4)
         },
     }
 
-    with open(dst_root / "metadata_stage2_insulator_centered.json", "w", encoding="utf-8") as f:
+    with open(
+        dst_root / "metadata_stage2_insulator_centered.json", "w", encoding="utf-8"
+    ) as f:
         json.dump(metadata, f, indent=2, ensure_ascii=False)
 
     print("\n================ Done ================")

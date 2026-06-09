@@ -99,9 +99,9 @@ def main():
         print(f"{k}: {v}")
 
     print("\nOutput:", DST_ROOT)
-    print("train files:", len(list((DST_ROOT / 'train').glob('*.pth'))))
-    print("val files:", len(list((DST_ROOT / 'val').glob('*.pth'))))
-    print("test files:", len(list((DST_ROOT / 'test').glob('*.pth'))))
+    print("train files:", len(list((DST_ROOT / "train").glob("*.pth"))))
+    print("val files:", len(list((DST_ROOT / "val").glob("*.pth"))))
+    print("test files:", len(list((DST_ROOT / "test").glob("*.pth"))))
 
 
 if __name__ == "__main__":

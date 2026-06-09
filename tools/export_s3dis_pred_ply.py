@@ -8,18 +8,18 @@ import torch
 
 S3DIS_PALETTE = np.array(
     [
-        [0, 255, 0],      # ceiling
-        [0, 0, 255],      # floor
-        [0, 255, 255],    # wall
-        [255, 255, 0],    # beam
-        [255, 0, 255],    # column
+        [0, 255, 0],  # ceiling
+        [0, 0, 255],  # floor
+        [0, 255, 255],  # wall
+        [255, 255, 0],  # beam
+        [255, 0, 255],  # column
         [100, 100, 255],  # window
         [200, 200, 100],  # door
-        [255, 0, 0],      # table
+        [255, 0, 0],  # table
         [170, 120, 200],  # chair
         [255, 150, 120],  # sofa
         [200, 100, 100],  # bookcase
-        [10, 200, 100],   # board
+        [10, 200, 100],  # board
         [200, 200, 200],  # clutter
     ],
     dtype=np.uint8,
@@ -59,7 +59,9 @@ def room_path_from_pred(pred_path: Path, data_root: Path) -> Path:
         )
 
     expected = data_root / (area or "Area_x") / f"{room}.pth"
-    raise FileNotFoundError(f"Could not find S3DIS room data for {pred_path}; expected {expected}")
+    raise FileNotFoundError(
+        f"Could not find S3DIS room data for {pred_path}; expected {expected}"
+    )
 
 
 def load_room_arrays(room_path: Path):
@@ -70,7 +72,9 @@ def load_room_arrays(room_path: Path):
     return np.load(room_path / "coord.npy"), np.load(room_path / "color.npy")
 
 
-def write_ply(path: Path, coord: np.ndarray, color: np.ndarray, pred: np.ndarray) -> None:
+def write_ply(
+    path: Path, coord: np.ndarray, color: np.ndarray, pred: np.ndarray
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     coord = coord.astype(np.float32)
     color = color.astype(np.uint8)
@@ -115,7 +119,9 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.out is not None and len(args.pred) > 1 and args.out.suffix:
-        raise ValueError("--out must be a directory when exporting multiple prediction files")
+        raise ValueError(
+            "--out must be a directory when exporting multiple prediction files"
+        )
 
     for pred_path in args.pred:
         pred = np.load(pred_path)

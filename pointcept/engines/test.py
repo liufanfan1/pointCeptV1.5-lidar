@@ -97,7 +97,7 @@ class TesterBase:
             batch_size=self.cfg.batch_size_test_per_gpu,
             shuffle=False,
             # num_workers=self.cfg.batch_size_test_per_gpu,
-            num_workers= 0,
+            num_workers=0,
             pin_memory=True,
             sampler=test_sampler,
             collate_fn=self.__class__.collate_fn,

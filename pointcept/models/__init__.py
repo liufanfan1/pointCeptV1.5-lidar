@@ -8,6 +8,7 @@ from .point_transformer_v2 import *
 from .point_transformer_v3 import *
 from .stratified_transformer import *
 from .spvcnn import *
+
 # OctFormer requires extra ocnn/dwconv dependencies; PTv3 reproduction does not need it.
 # from .octformer import *
 

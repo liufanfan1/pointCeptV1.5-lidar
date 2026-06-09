@@ -9,18 +9,18 @@ import torch
 
 S3DIS_PALETTE = np.array(
     [
-        [0, 255, 0],      # ceiling
-        [0, 0, 255],      # floor
-        [0, 255, 255],    # wall
-        [255, 255, 0],    # beam
-        [255, 0, 255],    # column
+        [0, 255, 0],  # ceiling
+        [0, 0, 255],  # floor
+        [0, 255, 255],  # wall
+        [255, 255, 0],  # beam
+        [255, 0, 255],  # column
         [100, 100, 255],  # window
         [200, 200, 100],  # door
-        [255, 0, 0],      # table
+        [255, 0, 0],  # table
         [170, 120, 200],  # chair
         [255, 150, 120],  # sofa
         [200, 100, 100],  # bookcase
-        [10, 200, 100],   # board
+        [10, 200, 100],  # board
         [200, 200, 200],  # clutter
     ],
     dtype=np.uint8,
@@ -63,7 +63,9 @@ def collect_area_predictions(result_dir, data_root, area):
             room_to_pred[room] = pred_path
             room_to_explicit[room] = is_explicit
 
-    return [(room, room_to_pred[room]) for room in sorted(room_to_pred, key=natural_key)]
+    return [
+        (room, room_to_pred[room]) for room in sorted(room_to_pred, key=natural_key)
+    ]
 
 
 def load_room(room_path):
@@ -150,11 +152,21 @@ def main():
     parser = argparse.ArgumentParser(
         description="Export all S3DIS room predictions in one area to a merged PLY."
     )
-    parser.add_argument("--result-dir", type=Path, required=True, help="Directory with *_pred.npy files.")
+    parser.add_argument(
+        "--result-dir",
+        type=Path,
+        required=True,
+        help="Directory with *_pred.npy files.",
+    )
     parser.add_argument("--data-root", type=Path, default=Path("data/s3dis"))
     parser.add_argument("--area", default="Area_5")
     parser.add_argument("--out", type=Path, default=None, help="Merged area PLY path.")
-    parser.add_argument("--room-out", type=Path, default=None, help="Optional directory for per-room PLY files.")
+    parser.add_argument(
+        "--room-out",
+        type=Path,
+        default=None,
+        help="Optional directory for per-room PLY files.",
+    )
     parser.add_argument("--color", choices=("pred", "rgb"), default="pred")
     parser.add_argument("--format", choices=("binary", "ascii"), default="binary")
     args = parser.parse_args()

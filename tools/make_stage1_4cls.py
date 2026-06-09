@@ -34,14 +34,17 @@ NEW_CLASS_NAMES = [
 ]
 
 # old label -> new label
-REMAP = np.array([
-    0,  # old 0 ground     -> new 0 ground
-    1,  # old 1 tower      -> new 1 tower_structure
-    2,  # old 2 line       -> new 2 line
-    1,  # old 3 insulator  -> new 1 tower_structure
-    1,  # old 4 hengdan    -> new 1 tower_structure
-    3,  # old 5 other      -> new 3 other
-], dtype=np.int64)
+REMAP = np.array(
+    [
+        0,  # old 0 ground     -> new 0 ground
+        1,  # old 1 tower      -> new 1 tower_structure
+        2,  # old 2 line       -> new 2 line
+        1,  # old 3 insulator  -> new 1 tower_structure
+        1,  # old 4 hengdan    -> new 1 tower_structure
+        3,  # old 5 other      -> new 3 other
+    ],
+    dtype=np.int64,
+)
 
 
 def parse_args():
