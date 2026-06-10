@@ -12,8 +12,8 @@ _base_ = ["../_base_/default_runtime.py"]
 #   3 background
 
 # Runtime settings
-batch_size = 2
-num_worker = 4
+batch_size = 8
+num_worker = 8
 mix_prob = 0.0
 empty_cache = True
 enable_amp = True
@@ -76,8 +76,8 @@ model = dict(
 
 # Scheduler settings
 # First run a sanity check. If OK, change epoch=100, eval_epoch=10.
-epoch = 50
-eval_epoch = 5
+epoch = 100
+eval_epoch = 20
 
 optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.01)
 scheduler = dict(
@@ -118,7 +118,7 @@ data = dict(
                 keys=("coord", "color", "segment"),
                 return_grid_coord=True,
             ),
-            dict(type="SphereCrop", point_max=65536, mode="random"),
+            dict(type="SphereCrop", point_max=100000, mode="random"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
@@ -144,7 +144,7 @@ data = dict(
                 keys=("coord", "color", "segment"),
                 return_grid_coord=True,
             ),
-            dict(type="SphereCrop", point_max=65536, mode="center"),
+            dict(type="SphereCrop", point_max=10000, mode="center"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
@@ -174,7 +174,7 @@ data = dict(
                 keys=("coord", "color"),
                 return_grid_coord=True,
             ),
-            crop=dict(type="SphereCrop", point_max=65536, mode="all"),
+            crop=dict(type="SphereCrop", point_max=100000, mode="all"),
             post_transform=[
                 dict(type="CenterShift", apply_z=False),
                 dict(type="ToTensor"),

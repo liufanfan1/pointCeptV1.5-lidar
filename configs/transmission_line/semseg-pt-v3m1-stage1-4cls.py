@@ -17,7 +17,7 @@ _base_ = ["../_base_/default_runtime.py"]
 #   3 other
 
 # Runtime settings
-batch_size = 8
+batch_size = 8  # 显存越大，训练更稳
 num_worker = 8
 mix_prob = 0.0
 empty_cache = True
@@ -37,7 +37,13 @@ model = dict(
         enc_depths=(2, 2, 2, 6, 2),
         enc_channels=(32, 64, 128, 256, 512),
         enc_num_head=(2, 4, 8, 16, 32),
-        enc_patch_size=(1024, 1024, 1024, 1024, 1024),
+        enc_patch_size=(
+            1024,
+            1024,
+            1024,
+            1024,
+            1024,
+        ),  # 越大，attention上下文更大，显存更高
         dec_depths=(2, 2, 2, 2),
         dec_channels=(64, 64, 128, 256),
         dec_num_head=(4, 4, 8, 16),
@@ -81,8 +87,8 @@ model = dict(
 
 # Scheduler settings
 # First run a sanity check. If results are reasonable, change epoch=100, eval_epoch=10.
-epoch = 20
-eval_epoch = 5
+epoch = 100
+eval_epoch = 20
 
 optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.01)
 scheduler = dict(
@@ -123,7 +129,9 @@ data = dict(
                 keys=("coord", "color", "segment"),
                 return_grid_coord=True,
             ),
-            dict(type="SphereCrop", point_max=65536, mode="random"),
+            dict(
+                type="SphereCrop", point_max=100000, mode="random"
+            ),  # 单个crop越多，上下文更完整，显存更高
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
@@ -143,13 +151,13 @@ data = dict(
             dict(type="CenterShift", apply_z=True),
             dict(
                 type="GridSample",
-                grid_size=0.05,
+                grid_size=0.05,  # grid_size越小，点保留越密，精度可能更好，显存和时间成本更高
                 hash_type="fnv",
                 mode="train",
                 keys=("coord", "color", "segment"),
                 return_grid_coord=True,
             ),
-            dict(type="SphereCrop", point_max=65536, mode="center"),
+            dict(type="SphereCrop", point_max=100000, mode="center"),
             dict(type="CenterShift", apply_z=False),
             dict(type="NormalizeColor"),
             dict(type="ToTensor"),
