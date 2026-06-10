@@ -245,9 +245,8 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-    
-    
+
+
 """ 
 /opt/conda/envs/pointcept/bin/python tools/train_transmission_line_two_stage.py \
   --num-gpus 1 \
