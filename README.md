@@ -245,11 +245,11 @@ exp/transmission/stage2_tower_ins_centered_w24/result/
 /opt/conda/envs/pointcept/bin/python tools/infer_transmission_line_two_stage.py \
   --data-root data/transmission_line \
   --split test \
-  --stage1-config exp/transmission/stage1_4cls_balance_w8_clean_v1/config.py \
-  --stage1-weight exp/transmission/stage1_4cls_balance_w8_clean_v1/model/model_best.pth \
-  --stage2-config exp/transmission/stage2_tower_ins_centered_w24/config.py \
-  --stage2-weight exp/transmission/stage2_tower_ins_centered_w24/model/model_best.pth \
-  --out exp/transmission/two_stage_infer_v1_fresh/result \
+  --stage1-config exp/transmission/stage1_4cls_balance_w8_clean_seq_v2/config.py \
+  --stage1-weight exp/transmission/stage1_4cls_balance_w8_clean_seq_v2/model/model_best.pth \
+  --stage2-config exp/transmission/stage2_tower_ins_centered_seq_v2/config.py \
+  --stage2-weight exp/transmission/stage2_tower_ins_centered_seq_v2/model/model_best.pth \
+  --out exp/transmission_two_stage_infer/two_stage_infer_v1/result \
   --fast-crop
 参数说明：
 

@@ -300,11 +300,11 @@ if __name__ == "__main__":
 
 """ 
 /opt/conda/envs/pointcept/bin/python tools/export_transmission_line_pred_ply.py \
-  /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission/two_stage_infer_scope_ts/result \
+  /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_two_stage_infer/two_stage_infer_v1/result \
   --data-root data/transmission_line \
   --split test \
-  --out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_ply/two_stage_infer/result_ply \
-  --merge-out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_plytwo_stage_infer/two_stage_test_pred.ply \
+  --out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_ply/two_stage_infer_v1/result_ply \
+  --merge-out /24085403037/PointTransformerV3/Pointcept-v1.5.1/exp/transmission_ply/two_stage_infer_v1/two_stage_test_pred.ply \
   --color pred \
   --world-coord
 """
