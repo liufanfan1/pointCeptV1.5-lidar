@@ -1,0 +1,324 @@
+# Pointcept Transmission Line Notes
+
+## 1. 数据类别极度不平衡
+源数据集
+```text
+train:
+  ground     86.154%
+  tower       9.945%
+  line        2.868%
+  insulator   1.033%
+
+val:
+  ground     87.490%
+  tower       7.630%
+  line        3.731%
+  insulator   1.149%
+
+test:
+  ground     94.449%
+  tower       3.735%
+  line        1.420%
+  insulator   0.396%
+```
+## 2. Pointcept 中 epoch/eval_epoch/loop 的真实含义
+
+这个仓库的 `epoch` 和常规理解不完全一样。
+
+基础配置里写着：
+
+```python
+epoch = 100      # total epoch, data loop = epoch // eval_epoch
+eval_epoch = 100 # sche total eval & checkpoint epoch
+```
+
+实际代码在 `pointcept/engines/defaults.py` 中会做：
+
+```python
+cfg.data.train.loop = cfg.epoch // cfg.eval_epoch
+```
+
+训练器在 `pointcept/engines/train.py` 中使用的是：
+
+```python
+self.max_epoch = cfg.eval_epoch
+```
+
+所以当前配置：
+
+```python
+epoch = 10
+eval_epoch = 2
+```
+
+会变成：
+
+```text
+data.train.loop = 10 // 2 = 5
+外层训练轮数 = 2
+每个外层 epoch 的训练样本数 = 原始 train 文件数 4641 * loop 5 = 23205 step
+总训练 step = 2 * 23205 = 46410 step
+```
+
+因此日志里显示 `Train: [1/2]`、`Train: [2/2]` 是正常的；它等价于总共 10 次数据遍历，只是被拆成 2 个外层 epoch，每个外层 epoch 内部 loop 了 5 次数据。
+
+## 4. 为什么训练和测试很慢
+耗时来源：
+1. `4641 x 5 = 23205` step / 外层 epoch。
+2. `batch_size = 1`。
+3. 原配置 `grid_size = 0.02`，体素很细，保留点多。
+4. 原配置 `SphereCrop(point_max=100000)`，每个 crop 最多 10 万点。
+5. 原配置 `enable_amp = False`，没有混合精度。
+6. 默认 hooks 中有 `PreciseEvaluator`，训练结束后自动对 127 个 test tile 做完整推理。
+
+## 5. 过采样脚本做了什么
+  tools/make_insulator_oversampled_train.py
+
+tile 级过采样规则：
+
+1. 扫描 train/val/test 的 `.pth` 文件。
+2. 统计每个 tile 里各类别点数。
+3. val/test 原样复制，不改动。
+4. train 中如果某个 tile 含 `insulator`，就把整个 `.pth` 文件 hardlink/copy 多份。
+5. 它不改变点坐标、不裁剪、不新增点、不改标签。
+
+解决的问题是：在train中，DataLoader 更频繁抽到“含 insulator 的 tile”。解决类别数据差异非常大。
+问题：但它不能保证后续随机 crop 真的裁到 insulator。
+
+## 6. 原 SphereCrop 的问题
+
+原训练 pipeline 是：
+
+```text
+读取一个 tile
+-> CenterShift
+-> RandomRotate / RandomScale / RandomFlip / RandomJitter
+-> GridSample
+-> SphereCrop(point_max=100000, mode=random)
+-> NormalizeColor
+-> ToTensor
+-> Collect
+```
+
+`SphereCrop(mode=random)` 的逻辑是：
+
+```text
+随机选一个点作为 crop 中心
+按距离取最近的 point_max 个点
+```
+
+它不看类别。因此即使某个 tile 含 insulator，只要 ground 占绝大多数，随机中心点仍然大概率落在 ground 区域，crop 出来的训练样本也可能全是 ground 或几乎没有小类。
+
+这就是 tile 过采样还不够的核心原因。
+
+## 7. 我们新增的ClassBalancedSphereCrop 的目的
+
+位置：`pointcept/datasets/transform.py`
+
+新增 transform：`ClassBalancedSphereCrop`
+
+它做的是 crop 级采样，不是文件级复制。
+
+当前配置：
+
+```python
+dict(
+    type="ClassBalancedSphereCrop",
+    point_max=50000,
+    mode="random",
+    class_choices=(3, 1),
+    class_probs=(0.75, 0.25),
+    p=0.9,
+)
+```
+含义：
+```text
+90% 概率优先围绕小类裁剪。
+小类中心点选择中：75% 偏向 insulator，25% 偏向 tower。
+如果当前 tile 没有这些类别，则退回普通随机 crop。
+每个 crop 最多 50000 点。
+```
+
+它和 `make_insulator_oversampled_train.py` 的区别：
+
+| 方法 | 发生阶段 | 作用对象 | 解决的问题 |
+| --- | --- | --- | --- |
+| `make_insulator_oversampled_train.py` | 训练前，生成数据集 | 整个 `.pth` tile | 更多抽到含 insulator 的 tile |
+| `ClassBalancedSphereCrop` | 训练时，transform 阶段 | 一个 crop 的中心点 | 抽到 tile 后，尽量裁到小类附近 |
+
+两者可以叠加。前者提高 tile 被抽到的概率，后者提高 crop 中真的包含小类的概率。
+
+## 8. 减少训练时间
+
+### 8.1 开启 AMP
+
+```python
+enable_amp = True
+```
+
+目的：减少显存和训练时间。
+
+### 8.2 关闭训练结束后的完整 test
+
+原默认 hooks 中有：
+
+```python
+dict(type="PreciseEvaluator", test_last=False)
+```
+
+现在配置里显式覆盖 hooks，只保留：
+
+```python
+hooks = [
+    dict(type="CheckpointLoader"),
+    dict(type="IterationTimer", warmup_iter=2),
+    dict(type="InformationWriter"),
+    dict(type="SemSegEvaluator"),
+    dict(type="CheckpointSaver", save_freq=None),
+]
+```
+
+目的：训练结束后不自动跑 127 个 test tile，先只看 val 指标。等 val 中 `tower/insulator` 不再是 0，再手动跑 test。
+
+### 8.3 调粗 grid_size
+
+原来：
+
+```python
+grid_size = 0.02
+```
+
+现在：
+
+```python
+grid_size = 0.05
+```
+
+目的：减少体素后的点数，加快训练和测试。代价是几何细节会少一些。当前阶段主要是确认采样策略是否能让小类学起来，先加速调参更重要。
+
+### 8.4 减小 crop 点数
+
+训练：
+
+```python
+ClassBalancedSphereCrop(point_max=50000)
+```
+
+验证：
+
+```python
+SphereCrop(point_max=50000, mode="center")
+```
+
+目的：减少每步计算量。
+
+### 8.5 调整 loss 权重
+
+原来：
+
+```python
+weight=[0.2, 1.0, 1.5, 4.0]
+```
+
+现在：
+
+```python
+weight=[0.1, 2.0, 2.0, 8.0]
+```
+
+目的：降低 ground 的权重，提高 tower/line/insulator 的学习压力，尤其是 insulator。
+
+## 9. 修改后预期变化
+
+好的迹象：
+
+```text
+val 中 tower IoU 不再是 0
+val 中 insulator IoU 不再是 0
+pred 分布里 insulator 不再是 0%
+训练时间明显下降
+训练结束后不会自动跑 1.5 小时 full test
+```
+
+需要警惕：
+
+```text
+insulator 召回上升但误检很多
+mIoU 仍然低，但小类开始有非零 IoU
+val allAcc 下降，这可能是正常的，因为模型不再只预测 ground
+```
+
+对这个任务来说，`allAcc` 不是主要指标，因为 ground 太多，全部预测 ground 也能得到很高 allAcc。更应该看：
+
+```text
+mIoU
+Class_1 tower IoU / Acc
+Class_3 insulator IoU / Acc
+预测中各类别占比
+```
+
+## 10. 建议的实验流程
+
+### 10.1 不要 resume 旧实验
+
+如果用 `resume=true`，脚本会加载旧的：
+
+```text
+exp/transmission_line/ptv3-4cls-ins-oversample/config.py
+```
+
+这样不会使用新配置。
+
+建议开新实验名，例如：
+
+```bash
+sh scripts/train.sh \
+  -p /opt/conda/envs/pointcept/bin/python \
+  -d transmission_line \
+  -c semseg-pt-v3m1-4cls-ins-oversample \
+  -n ptv3-4cls-ins-crop-fast \
+  -g 1
+```
+
+具体 `-g` 根据你的 GPU 数量调整。
+
+### 10.2 先看 val，不急着 full test
+
+训练完成后先看：
+
+```text
+exp/transmission_line/ptv3-4cls-ins-crop-fast/train.log
+```
+
+重点搜索：
+
+```bash
+rg -n "Val result|Class_1|Class_3|Best validation" exp/transmission_line/ptv3-4cls-ins-crop-fast/train.log
+```
+
+如果 `Class_1-tower` 和 `Class_3-insulator` 仍然全是 0，再继续调采样或 loss。
+
+### 10.3 val 指标合理后再跑 test
+
+等 val 中小类有非零 IoU 后，再手动跑完整 test。不要每次训练都自动 precise test。
+
+## 11. 如果结果仍然差，下一步怎么排查
+
+1. 做小样本过拟合实验：只选 5-10 个含 tower/insulator 的 tile，训练到这些 tile 上小类接近拟合。如果小样本都学不会，才更像 label/mapping/model 问题。
+2. 可视化 crop 后的样本，确认 `ClassBalancedSphereCrop` 裁出来的点确实围绕 insulator/tower。
+3. 检查颜色特征是否可靠。如果 RGB 对类别没有帮助，可能需要加强几何特征或后处理。
+4. 调 `ClassBalancedSphereCrop`：
+   - `p=0.9` 可改到 `0.7`，降低误检。
+   - `class_probs=(0.75, 0.25)` 可改成 `(0.6, 0.4)`，增强 tower。
+   - `point_max=50000` 可回到 `80000/100000`，提升上下文。
+5. 调 loss 权重：如果 insulator 误检太多，降低 `8.0`；如果还是完全不预测，提高到 `10.0` 或继续优化采样。
+
+## 12. 当前结论
+
+当前结果差的主要原因不是明显的类别数写错、标签 key 读取错、模型输出维度错，而是：
+
+```text
+长尾小类 + 随机 crop 大概率看不到小类 + ground 点级占比过高
+```
+
+你原来的 tile 级过采样是必要的，但还不够。新增 `ClassBalancedSphereCrop` 是在训练时补上 crop 级的小类采样，让模型更频繁看到真正含 `insulator/tower` 的局部区域。
