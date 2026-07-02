@@ -142,8 +142,8 @@ def parse_args():
         choices=("las-offset", "las-min", "zero", "custom"),
         default="las-offset",
         help=(
-            "Origin used for obb[0:3] relative coordinates. obb_global.lat_lng_alt "
-            "stores this origin. Default: LAS header offsets."
+            "Origin used for obb[0:3] relative coordinates. For box JSON, "
+            "obb_global.las_origin stores this origin. Default: LAS header offsets."
         ),
     )# 控制JSON中的OBB旋转框使用什么相对坐标原点
     # las-offset  使用 LAS header offset，推荐
@@ -158,7 +158,17 @@ def parse_args():
         metavar=("X", "Y", "Z"),
         help="Custom origin for --obb-origin custom.",
     )# 自定义原点
-  
+    parser.add_argument(
+        "--json-box-orientation",
+        choices=("fitted", "north"),
+        default="fitted",
+        help=(
+            "fitted keeps fitted OBB boxes and exports right-handed rotation "
+            "relative to LAS X+ north; north writes an unrotated north-facing "
+            "axis-aligned JSON box."
+        ),
+    )# JSON框朝向。fitted表示右手坐标系下按LAS X+正北导出旋转；north表示强制不旋转的正北轴对齐框。
+
     parser.add_argument("--background-class", type=int, default=0)
     parser.add_argument("--tower-class", type=int, default=1)
     parser.add_argument("--line-class", type=int, default=2)
@@ -219,6 +229,300 @@ def parse_args():
         ),
     )# 杆塔附近至少要有多少导线点。0 表示不启用这个过滤。
     parser.add_argument(
+        "--require-line-through-tower",
+        action="store_true",
+        help=(
+            "Keep only tower components whose expanded XY footprint contains "
+            "enough line points in the upper tower height range."
+        ),
+    )# 更严格：要求导线点穿过/落在杆塔候选区域上部，适合过滤线路走廊旁边的杆塔误检。
+    parser.add_argument(
+        "--tower-line-through-xy-margin",
+        type=float,
+        default=3.0,
+        help="XY margin in meters around tower component bbox for through-line filter.",
+    )# 判断导线是否穿过杆塔候选区域时，杆塔XY框向外扩的距离。
+    parser.add_argument(
+        "--tower-line-through-z-margin",
+        type=float,
+        default=3.0,
+        help="Z margin in meters around the upper tower range for through-line filter.",
+    )# 判断导线高度时，上下放宽的距离。
+    parser.add_argument(
+        "--tower-line-through-cross-margin",
+        type=float,
+        default=1.0,
+        help=(
+            "Extra along-line distance beyond both sides of the tower footprint "
+            "required by --require-line-through-tower."
+        ),
+    )# 穿越判定：导线点必须超过杆塔沿线路方向的两侧边界。
+    parser.add_argument(
+        "--min-line-points-through-tower-side",
+        type=int,
+        default=5,
+        help="Minimum through-line points required on each side of a tower.",
+    )# 穿越判定：杆塔前后两侧各自最少导线点数。
+    parser.add_argument(
+        "--tower-line-through-min-height-ratio",
+        type=float,
+        default=0.45,
+        help=(
+            "Only count line points above this fraction of the tower component "
+            "height for --require-line-through-tower."
+        ),
+    )# 只统计杆塔高度上部的导线点，避免地面附近误检被保留。
+    parser.add_argument(
+        "--min-line-points-through-tower",
+        type=int,
+        default=20,
+        help="Minimum line points required by --require-line-through-tower.",
+    )# 穿过杆塔候选区域的最少导线点数。
+    parser.add_argument(
+        "--require-line-touch-tower",
+        action="store_true",
+        help=(
+            "Keep only physical towers whose upper tower points are close "
+            "enough to line points in 3D. This removes towers below/near "
+            "lines but not actually touched by lines."
+        ),
+    )# 要求杆塔上部点和导线点在三维空间真正接近/接触，用于删除黄色框这种假塔。
+    parser.add_argument(
+        "--tower-line-contact-radius",
+        type=float,
+        default=None,
+        help=(
+            "3D distance threshold in meters for line-touch filtering. If omitted, "
+            "--tower-line-touch-xy-margin is used for backward compatibility."
+        ),
+    )# 杆塔点到导线点的三维接触距离阈值。越小越严格。
+    parser.add_argument(
+        "--tower-line-touch-xy-margin",
+        type=float,
+        default=1.5,
+        help=(
+            "Backward-compatible contact radius in meters when "
+            "--tower-line-contact-radius is not set."
+        ),
+    )# 兼容旧参数：未设置contact-radius时，用它作为三维接触距离阈值。
+    parser.add_argument(
+        "--tower-line-touch-z-margin",
+        type=float,
+        default=2.0,
+        help="Deprecated compatibility option; not used by the 3D contact filter.",
+    )# 兼容旧命令保留；当前三维接触过滤不再使用它。
+    parser.add_argument(
+        "--tower-line-touch-min-height-ratio",
+        type=float,
+        default=0.45,
+        help="Only count line points above this fraction of tower height.",
+    )# 只统计杆塔上部的导线点，避免地面附近误检影响。
+    parser.add_argument(
+        "--min-line-points-touch-tower",
+        type=int,
+        default=20,
+        help="Minimum upper tower points close to line points required to keep a tower.",
+    )# 杆塔上部至少有多少个点和导线点接近，才保留该杆塔。
+    parser.add_argument(
+        "--require-line-inside-tower",
+        action="store_true",
+        help=(
+            "Keep only physical towers with enough line points inside the "
+            "middle/upper core of the tower OBB."
+        ),
+    )# 要求杆塔中部/上部核心区域内必须有足够导线点。
+    parser.add_argument(
+        "--tower-line-inside-xy-scale",
+        type=float,
+        default=0.45,
+        help="Fraction of tower OBB half XY size used as the inside/core region.",
+    )# 塔体内部核心区域的XY比例，越小越严格。
+    parser.add_argument(
+        "--tower-line-inside-min-height-ratio",
+        type=float,
+        default=0.45,
+        help="Only count line points above this fraction of tower height.",
+    )# 只统计杆塔高度上部/中部的导线点。
+    parser.add_argument(
+        "--min-line-points-inside-tower",
+        type=int,
+        default=80,
+        help="Minimum line points inside the tower core required to keep a tower.",
+    )# 杆塔核心区域内最少导线点数量。
+    parser.add_argument(
+        "--require-continuous-line-inside-tower",
+        action="store_true",
+        help=(
+            "Keep only physical towers where line points form a continuous "
+            "track inside the tower OBB core."
+        ),
+    )# 要求线路点在杆塔框核心区域内连续进入，而不是零散点或擦边点。
+    parser.add_argument(
+        "--continuous-line-inside-xy-scale",
+        type=float,
+        default=0.35,
+        help="Fraction of tower OBB half XY size used by the continuous-line core.",
+    )# 连续线路判定使用的塔框XY核心比例，越小越严格。
+    parser.add_argument(
+        "--continuous-line-inside-min-height-ratio",
+        type=float,
+        default=0.45,
+        help="Only count continuous line points above this fraction of tower height.",
+    )# 连续线路判定只看杆塔中上部。
+    parser.add_argument(
+        "--continuous-line-bin-size",
+        type=float,
+        default=0.50,
+        help="Along-line bin size in meters for continuous inside-line filtering.",
+    )# 沿线路方向分箱的长度。
+    parser.add_argument(
+        "--min-continuous-line-bins",
+        type=int,
+        default=6,
+        help="Minimum consecutive occupied bins required inside the tower core.",
+    )# 至少连续占据多少个bin。
+    parser.add_argument(
+        "--min-continuous-line-length",
+        type=float,
+        default=3.0,
+        help="Minimum continuous along-line length in meters inside the tower core.",
+    )# 杆塔框内连续线路段最小长度。
+    parser.add_argument(
+        "--min-continuous-line-points",
+        type=int,
+        default=60,
+        help="Minimum total line points in the continuous tower-core region.",
+    )# 连续线路核心区域内最少线路点数量。
+    parser.add_argument(
+        "--require-side-line-near-tower",
+        action="store_true",
+        help=(
+            "Keep only physical towers with enough line points near the left "
+            "or right side face of the tower box, excluding lines above the box."
+        ),
+    )# 要求杆塔框左侧或右侧必须有线路点，上方飘过不算。
+    parser.add_argument(
+        "--tower-side-line-window",
+        type=float,
+        default=2.0,
+        help="Along-line window in meters around each tower side face.",
+    )# 杆塔左右侧面附近沿线路方向的统计窗口。
+    parser.add_argument(
+        "--tower-side-line-xy-margin",
+        type=float,
+        default=1.5,
+        help="Perpendicular XY margin in meters for side-line filtering.",
+    )# 侧边线路判定的横向容差。
+    parser.add_argument(
+        "--tower-side-line-z-margin",
+        type=float,
+        default=0.3,
+        help="Allowed meters above tower box top; small values reject overhead lines.",
+    )# 允许超过杆塔框顶部的高度，越小越能排除上方线路。
+    parser.add_argument(
+        "--tower-side-line-min-height-ratio",
+        type=float,
+        default=0.35,
+        help="Only count side line points above this fraction of tower height.",
+    )# 只统计杆塔中上部侧边线路点。
+    parser.add_argument(
+        "--min-side-line-points",
+        type=int,
+        default=30,
+        help="Minimum line points required on either tower side face.",
+    )# 左侧或右侧至少需要多少线路点。
+    parser.add_argument(
+        "--require-insulator-near-tower",
+        action="store_true",
+        help=(
+            "Keep only physical towers with enough insulator points near the "
+            "upper tower box. Useful for removing pole-like false positives "
+            "that are under lines but not connected to them."
+        ),
+    )# 更严格：要求物理杆塔上部附近必须有绝缘子点。
+    parser.add_argument(
+        "--tower-insulator-xy-margin",
+        type=float,
+        default=6.0,
+        help="XY margin in meters around tower OBB when searching insulator points.",
+    )# 搜索绝缘子点时，杆塔旋转框 XY 外扩距离。
+    parser.add_argument(
+        "--tower-insulator-z-margin",
+        type=float,
+        default=6.0,
+        help="Z margin in meters around the upper tower range for insulator filter.",
+    )# 搜索绝缘子点时，高度方向放宽距离。
+    parser.add_argument(
+        "--tower-insulator-min-height-ratio",
+        type=float,
+        default=0.35,
+        help="Only count insulator points above this fraction of tower height.",
+    )# 只统计杆塔上部的绝缘子点，避免地面噪声干扰。
+    parser.add_argument(
+        "--min-insulator-points-near-tower",
+        type=int,
+        default=10,
+        help="Minimum insulator points required by --require-insulator-near-tower.",
+    )# 每座物理杆塔附近至少需要多少绝缘子点。
+    parser.add_argument(
+        "--require-insulator-line-bridge",
+        action="store_true",
+        help=(
+            "Keep only physical towers with enough nearby insulator points that "
+            "are also close to line points."
+        ),
+    )# 要求杆塔附近的绝缘子必须和导线相邻，作为塔-线连接桥。
+    parser.add_argument(
+        "--insulator-line-radius",
+        type=float,
+        default=1.2,
+        help="3D radius in meters used to test whether an insulator point is close to line.",
+    )# 绝缘子点到导线点的三维距离阈值。
+    parser.add_argument(
+        "--min-bridged-insulator-points",
+        type=int,
+        default=20,
+        help="Minimum nearby insulator points close to line points required to keep a tower.",
+    )# 同时靠近杆塔和导线的绝缘子点最少数量。
+    parser.add_argument(
+        "--remove-bare-pole-towers",
+        action="store_true",
+        help=(
+            "Remove pole-like tower false positives whose upper tower points "
+            "do not spread enough in XY. This targets bare poles under lines."
+        ),
+    )# 删除上部没有横向展开的光杆/瘦杆误检。
+    parser.add_argument(
+        "--bare-pole-upper-height-ratio",
+        type=float,
+        default=0.45,
+        help="Use tower points above this height ratio to detect bare poles.",
+    )# 判断光杆时，只看杆塔上部点。
+    parser.add_argument(
+        "--min-upper-tower-width",
+        type=float,
+        default=4.0,
+        help=(
+            "Minimum max XY spread in meters for upper tower points. Smaller "
+            "upper spread is treated as a bare pole when --remove-bare-pole-towers is enabled."
+        ),
+    )# 杆塔上部横向展开最小宽度，低于该值认为是光杆。
+    parser.add_argument(
+        "--min-upper-tower-area",
+        type=float,
+        default=4.0,
+        help=(
+            "Minimum upper XY footprint area in square meters. Used together "
+            "with --min-upper-tower-width for bare-pole filtering."
+        ),
+    )# 杆塔上部横向包围面积，低于该值认为是光杆。
+    parser.add_argument(
+        "--min-upper-tower-points",
+        type=int,
+        default=200,
+        help="Minimum upper tower points required to keep a tower in bare-pole filtering.",
+    )# 杆塔上部最少点数，太少也认为不像真实杆塔结构。
+    parser.add_argument(
         "--min-tower-height-above-ground",
         type=float,
         default=0.0,
@@ -233,6 +537,39 @@ def parse_args():
         default=8.0,
         help="XY radius in meters used to estimate local ground height.",
     )# 估计局部地面高度时，在杆塔附近搜索背景点的 XY 半径。
+    parser.add_argument(
+        "--require-tower-top-line",
+        action="store_true",
+        help=(
+            "Keep only physical towers whose top area has enough nearby line "
+            "points. This is useful for sparse pole-style segmentation where "
+            "ground objects are often mislabeled as tower."
+        ),
+    )# 稀疏杆塔输入适配：杆塔顶部附近必须有导线点。
+    parser.add_argument(
+        "--tower-top-line-xy-margin",
+        type=float,
+        default=6.0,
+        help="XY margin in meters around the tower footprint for top-line filtering.",
+    )# 顶部接线过滤：杆塔XY范围外扩距离。
+    parser.add_argument(
+        "--tower-top-line-z-below",
+        type=float,
+        default=5.0,
+        help="Meters below tower top used when counting nearby line points.",
+    )# 顶部接线过滤：从杆塔顶部向下统计多少米。
+    parser.add_argument(
+        "--tower-top-line-z-above",
+        type=float,
+        default=8.0,
+        help="Meters above tower top used when counting nearby line points.",
+    )# 顶部接线过滤：从杆塔顶部向上统计多少米。
+    parser.add_argument(
+        "--min-tower-top-line-points",
+        type=int,
+        default=30,
+        help="Minimum line points near tower top required to keep a physical tower.",
+    )# 顶部附近至少需要多少导线点。
     parser.add_argument(
         "--merge-tower-xy-radius",
         type=float,
@@ -337,6 +674,29 @@ def parse_args():
         default=50,
         help="Skip a between-tower line box if fewer line points are selected.",
     )
+    parser.add_argument(
+        "--require-connected-line-span",
+        action="store_true",
+        help=(
+            "Keep only physical towers that are used by at least one valid "
+            "line span with the left or right neighboring tower."
+        ),
+    )# 只保留至少和左/右相邻杆塔通过有效线路档距相连的杆塔。
+    parser.add_argument(
+        "--span-end-contact-window",
+        type=float,
+        default=8.0,
+        help=(
+            "Meters from each tower box edge used to verify that line points "
+            "connect to both ends of a span."
+        ),
+    )# 判断档距是否真正接入杆塔时，每个杆塔端部附近统计线路点的窗口长度。
+    parser.add_argument(
+        "--min-span-end-contact-points",
+        type=int,
+        default=20,
+        help="Minimum line points required near each tower end of a connected span.",
+    )# 有效档距左右两端各自至少需要多少线路点。
     parser.add_argument(
         "--edge-step",
         type=float,
@@ -576,12 +936,31 @@ def mark_components_to_keep(components, coord, cls, args):
     for comp in components:
         size = comp["size"]
         comp["nearby_line_points"] = 0
+        comp["through_line_points"] = 0
         comp["height_above_ground"] = None
         if line_tree is not None and (
             args.require_line_near_tower or args.min_line_points_near_tower > 0
         ):
             hits = line_tree.query_ball_point(comp["center"][:2], args.tower_line_radius)
             comp["nearby_line_points"] = int(len(hits))
+        if args.require_line_through_tower and line_coord.shape[0]:
+            xy_margin = float(args.tower_line_through_xy_margin)
+            z_margin = float(args.tower_line_through_z_margin)
+            height_ratio = float(args.tower_line_through_min_height_ratio)
+            height_ratio = min(max(height_ratio, 0.0), 1.0)
+            lo_xy = comp["bbox_min"][:2] - xy_margin
+            hi_xy = comp["bbox_max"][:2] + xy_margin
+            z_lo = comp["bbox_min"][2] + float(size[2]) * height_ratio - z_margin
+            z_hi = comp["bbox_max"][2] + z_margin
+            mask = (
+                (line_coord[:, 0] >= lo_xy[0])
+                & (line_coord[:, 0] <= hi_xy[0])
+                & (line_coord[:, 1] >= lo_xy[1])
+                & (line_coord[:, 1] <= hi_xy[1])
+                & (line_coord[:, 2] >= z_lo)
+                & (line_coord[:, 2] <= z_hi)
+            )
+            comp["through_line_points"] = int(np.count_nonzero(mask))
         if args.min_tower_height_above_ground > 0:
             ground_z = global_ground_z
             if bg_tree is not None:
@@ -614,6 +993,12 @@ def mark_components_to_keep(components, coord, cls, args):
         ):
             comp["keep"] = False
             comp["remove_reason"] = "too_few_nearby_line_points"
+        elif (
+            args.require_line_through_tower
+            and comp["through_line_points"] < args.min_line_points_through_tower
+        ):
+            comp["keep"] = False
+            comp["remove_reason"] = "too_few_through_line_points"
         elif (
             args.min_tower_height_above_ground > 0
             and comp["height_above_ground"] < args.min_tower_height_above_ground
@@ -873,6 +1258,8 @@ def make_oriented_tower_box(points, margin):
         long_xy = np.array([1.0, 0.0], dtype=np.float64)
     else:
         long_xy = long_xy / norm
+    # PCA eigenvectors have arbitrary sign. Prefer the north-facing equivalent so
+    # tower quaternions do not flip by 180 degrees between similar detections.
     if long_xy[0] < 0 or (abs(long_xy[0]) < 1e-9 and long_xy[1] < 0):
         long_xy = -long_xy
     axes = local_axes_from_direction(long_xy)
@@ -915,6 +1302,660 @@ def tower_boxes(towers, coord, tower_indices, point_comp, margin):
             }
         )
     return boxes
+
+
+def count_line_points_through_tower_box(line_coord, tower_box, args):
+    empty = {"total": 0, "before": 0, "after": 0}
+    if line_coord.shape[0] == 0:
+        return empty
+
+    center = tower_box["center"]
+    half_size = tower_box["half_size"]
+    corners = oriented_box_corners(center, tower_box["axes"], half_size)
+    line_axis = main_axis_xy(line_coord[:, :2])
+    side_axis = np.array([-line_axis[1], line_axis[0]], dtype=np.float64)
+
+    rel_line_xy = line_coord[:, :2] - center[None, :2]
+    line_along = rel_line_xy @ line_axis
+    line_side = rel_line_xy @ side_axis
+    rel_corner_xy = corners[:, :2] - center[None, :2]
+    along_extent = float(np.max(np.abs(rel_corner_xy @ line_axis)))
+    side_extent = float(np.max(np.abs(rel_corner_xy @ side_axis)))
+
+    xy_margin = float(args.tower_line_through_xy_margin)
+    z_margin = float(args.tower_line_through_z_margin)
+    cross_margin = float(args.tower_line_through_cross_margin)
+    height_ratio = min(max(float(args.tower_line_through_min_height_ratio), 0.0), 1.0)
+    z_min = center[2] - half_size[2] + (2.0 * half_size[2]) * height_ratio - z_margin
+    z_max = center[2] + half_size[2] + z_margin
+    upper_corridor = (
+        (np.abs(line_side) <= side_extent + xy_margin)
+        & (line_coord[:, 2] >= z_min)
+        & (line_coord[:, 2] <= z_max)
+    )
+    before = upper_corridor & (line_along <= -(along_extent + cross_margin))
+    after = upper_corridor & (line_along >= along_extent + cross_margin)
+    before_count = int(np.count_nonzero(before))
+    after_count = int(np.count_nonzero(after))
+    return {
+        "total": before_count + after_count,
+        "before": before_count,
+        "after": after_count,
+    }
+
+
+def filter_towers_by_line_through_box(
+    components, towers, tower_box_list, coord, cls, args
+):
+    if not args.require_line_through_tower:
+        return towers, tower_box_list, 0
+    line_coord = coord[cls == args.line_class]
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        through_counts = (
+            count_line_points_through_tower_box(line_coord, box, args)
+            if box is not None
+            else {"total": 0, "before": 0, "after": 0}
+        )
+        tower["through_line_points"] = int(through_counts["total"])
+        tower["through_line_points_before"] = int(through_counts["before"])
+        tower["through_line_points_after"] = int(through_counts["after"])
+        if (
+            through_counts["total"] >= args.min_line_points_through_tower
+            and through_counts["before"] >= args.min_line_points_through_tower_side
+            and through_counts["after"] >= args.min_line_points_through_tower_side
+        ):
+            kept_towers.append(tower)
+            continue
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_line_through"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def tower_line_contact_radius(args):
+    radius = args.tower_line_contact_radius
+    if radius is None:
+        radius = args.tower_line_touch_xy_margin
+    return max(float(radius), 0.0)
+
+
+def count_line_points_touch_tower(line_tree, tower_points, tower_box, args):
+    empty = {"count": 0, "min_distance": None, "radius": tower_line_contact_radius(args)}
+    if line_tree is None or tower_points.shape[0] == 0 or tower_box is None:
+        return empty
+
+    center = tower_box["center"]
+    axes = tower_box["axes"]
+    half_size = tower_box["half_size"]
+    height_ratio = min(max(float(args.tower_line_touch_min_height_ratio), 0.0), 1.0)
+    local = (tower_points - center[None, :]) @ axes.T
+    z_min = -half_size[2] + (2.0 * half_size[2]) * height_ratio
+    upper_points = tower_points[local[:, 2] >= z_min]
+    if upper_points.shape[0] == 0:
+        return empty
+
+    distance, _ = line_tree.query(upper_points, k=1)
+    radius = empty["radius"]
+    contact_count = int(np.count_nonzero(distance <= radius))
+    return {
+        "count": contact_count,
+        "min_distance": float(np.min(distance)) if distance.size else None,
+        "radius": radius,
+    }
+
+
+def filter_towers_by_line_touch_box(
+    components, towers, tower_box_list, coord, cls, tower_indices, point_comp, args
+):
+    if not args.require_line_touch_tower:
+        return towers, tower_box_list, 0
+
+    line_coord = coord[cls == args.line_class]
+    line_tree = cKDTree(line_coord) if line_coord.shape[0] else None
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        tower_points = points_for_tower(
+            coord, tower_indices, point_comp, tower["component_ids"]
+        )
+        contact = count_line_points_touch_tower(
+            line_tree, tower_points, box, args
+        )
+        tower["touch_line_points"] = int(contact["count"])
+        tower["line_touch_min_distance"] = contact["min_distance"]
+        tower["line_touch_radius"] = float(contact["radius"])
+        if contact["count"] >= int(args.min_line_points_touch_tower):
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_line_touch"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def count_line_points_inside_tower_core(line_coord, tower_box, args):
+    if line_coord.shape[0] == 0 or tower_box is None:
+        return 0
+
+    center = tower_box["center"]
+    axes = tower_box["axes"]
+    half_size = tower_box["half_size"]
+    xy_scale = min(max(float(args.tower_line_inside_xy_scale), 0.0), 1.0)
+    height_ratio = min(max(float(args.tower_line_inside_min_height_ratio), 0.0), 1.0)
+
+    expanded_half = half_size.copy()
+    corners = oriented_box_corners(center, axes, expanded_half)
+    world_min = corners.min(axis=0)
+    world_max = corners.max(axis=0)
+    coarse = np.all(
+        (line_coord >= world_min[None, :]) & (line_coord <= world_max[None, :]),
+        axis=1,
+    )
+    if not np.any(coarse):
+        return 0
+
+    local = (line_coord[coarse] - center[None, :]) @ axes.T
+    z_min = -half_size[2] + (2.0 * half_size[2]) * height_ratio
+    inside = (
+        (np.abs(local[:, 0]) <= half_size[0] * xy_scale)
+        & (np.abs(local[:, 1]) <= half_size[1] * xy_scale)
+        & (local[:, 2] >= z_min)
+        & (local[:, 2] <= half_size[2])
+    )
+    return int(np.count_nonzero(inside))
+
+
+def filter_towers_by_line_inside_box(components, towers, tower_box_list, coord, cls, args):
+    if not args.require_line_inside_tower:
+        return towers, tower_box_list, 0
+
+    line_coord = coord[cls == args.line_class]
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        inside_count = count_line_points_inside_tower_core(line_coord, box, args)
+        tower["inside_tower_line_points"] = int(inside_count)
+        if inside_count >= int(args.min_line_points_inside_tower):
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_too_few_inside_line_points"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def max_consecutive_run(values):
+    if values.size == 0:
+        return 0
+    values = np.unique(values)
+    best = 1
+    current = 1
+    for index in range(1, values.size):
+        if values[index] == values[index - 1] + 1:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 1
+    return int(best)
+
+
+def continuous_line_inside_tower_stats(line_coord, tower_box, line_axis, args):
+    empty = {
+        "point_count": 0,
+        "occupied_bins": 0,
+        "max_run_bins": 0,
+        "max_run_length": 0.0,
+    }
+    if line_coord.shape[0] == 0 or tower_box is None:
+        return empty
+
+    center = tower_box["center"]
+    axes = tower_box["axes"]
+    half_size = tower_box["half_size"]
+    xy_scale = min(max(float(args.continuous_line_inside_xy_scale), 0.0), 1.0)
+    height_ratio = min(max(float(args.continuous_line_inside_min_height_ratio), 0.0), 1.0)
+    bin_size = max(float(args.continuous_line_bin_size), 1e-3)
+
+    corners = oriented_box_corners(center, axes, half_size)
+    world_min = corners.min(axis=0)
+    world_max = corners.max(axis=0)
+    coarse = np.all(
+        (line_coord >= world_min[None, :]) & (line_coord <= world_max[None, :]),
+        axis=1,
+    )
+    if not np.any(coarse):
+        return empty
+
+    candidates = line_coord[coarse]
+    local = (candidates - center[None, :]) @ axes.T
+    z_min = -half_size[2] + (2.0 * half_size[2]) * height_ratio
+    inside = (
+        (np.abs(local[:, 0]) <= half_size[0] * xy_scale)
+        & (np.abs(local[:, 1]) <= half_size[1] * xy_scale)
+        & (local[:, 2] >= z_min)
+        & (local[:, 2] <= half_size[2])
+    )
+    inside_points = candidates[inside]
+    if inside_points.shape[0] == 0:
+        return empty
+
+    along = (inside_points[:, :2] - center[None, :2]) @ line_axis
+    bins = np.floor((along - along.min()) / bin_size).astype(np.int64)
+    occupied_bins = np.unique(bins)
+    max_run_bins = max_consecutive_run(occupied_bins)
+    return {
+        "point_count": int(inside_points.shape[0]),
+        "occupied_bins": int(occupied_bins.size),
+        "max_run_bins": int(max_run_bins),
+        "max_run_length": float(max_run_bins * bin_size),
+    }
+
+
+def filter_towers_by_continuous_line_inside_box(
+    components, towers, tower_box_list, coord, cls, args
+):
+    if not args.require_continuous_line_inside_tower:
+        return towers, tower_box_list, 0
+
+    line_coord = coord[cls == args.line_class]
+    line_axis = main_axis_xy(line_coord[:, :2]) if line_coord.shape[0] else np.array([1.0, 0.0])
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        stats = continuous_line_inside_tower_stats(line_coord, box, line_axis, args)
+        tower["continuous_inside_line_points"] = int(stats["point_count"])
+        tower["continuous_inside_line_bins"] = int(stats["occupied_bins"])
+        tower["continuous_inside_line_max_run_bins"] = int(stats["max_run_bins"])
+        tower["continuous_inside_line_max_run_length"] = float(stats["max_run_length"])
+        if (
+            stats["point_count"] >= int(args.min_continuous_line_points)
+            and stats["max_run_bins"] >= int(args.min_continuous_line_bins)
+            and stats["max_run_length"] >= float(args.min_continuous_line_length)
+        ):
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_continuous_inside_line"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def side_line_near_tower_stats(line_coord, tower_box, line_axis, args):
+    empty = {"left": 0, "right": 0, "total": 0}
+    if line_coord.shape[0] == 0 or tower_box is None:
+        return empty
+
+    center = tower_box["center"]
+    half_size = tower_box["half_size"]
+    corners = oriented_box_corners(center, tower_box["axes"], half_size)
+    rel_corner_xy = corners[:, :2] - center[None, :2]
+    side_axis = np.array([-line_axis[1], line_axis[0]], dtype=np.float64)
+    along_extent = float(np.max(np.abs(rel_corner_xy @ line_axis)))
+    side_extent = float(np.max(np.abs(rel_corner_xy @ side_axis)))
+
+    rel_line_xy = line_coord[:, :2] - center[None, :2]
+    along = rel_line_xy @ line_axis
+    side = rel_line_xy @ side_axis
+
+    window = max(float(args.tower_side_line_window), 0.0)
+    xy_margin = max(float(args.tower_side_line_xy_margin), 0.0)
+    z_margin = float(args.tower_side_line_z_margin)
+    height_ratio = min(max(float(args.tower_side_line_min_height_ratio), 0.0), 1.0)
+    z_min = center[2] - half_size[2] + (2.0 * half_size[2]) * height_ratio
+    z_max = center[2] + half_size[2] + z_margin
+    height_mask = (line_coord[:, 2] >= z_min) & (line_coord[:, 2] <= z_max)
+    side_mask = np.abs(side) <= side_extent + xy_margin
+    left_mask = (
+        height_mask
+        & side_mask
+        & (along >= -along_extent - window)
+        & (along <= -along_extent + window)
+    )
+    right_mask = (
+        height_mask
+        & side_mask
+        & (along >= along_extent - window)
+        & (along <= along_extent + window)
+    )
+    left_count = int(np.count_nonzero(left_mask))
+    right_count = int(np.count_nonzero(right_mask))
+    return {"left": left_count, "right": right_count, "total": left_count + right_count}
+
+
+def filter_towers_by_side_line_box(components, towers, tower_box_list, coord, cls, args):
+    if not args.require_side_line_near_tower:
+        return towers, tower_box_list, 0
+
+    line_coord = coord[cls == args.line_class]
+    line_axis = main_axis_xy(line_coord[:, :2]) if line_coord.shape[0] else np.array([1.0, 0.0])
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        stats = side_line_near_tower_stats(line_coord, box, line_axis, args)
+        tower["side_line_left_points"] = int(stats["left"])
+        tower["side_line_right_points"] = int(stats["right"])
+        tower["side_line_points"] = int(stats["total"])
+        if max(stats["left"], stats["right"]) >= int(args.min_side_line_points):
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_side_line"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def count_insulator_points_near_tower_box(insulator_coord, tower_box, args):
+    if insulator_coord.shape[0] == 0 or tower_box is None:
+        return 0
+    center = tower_box["center"]
+    axes = tower_box["axes"]
+    half_size = tower_box["half_size"]
+    local = (insulator_coord - center[None, :]) @ axes.T
+
+    xy_margin = float(args.tower_insulator_xy_margin)
+    z_margin = float(args.tower_insulator_z_margin)
+    height_ratio = min(max(float(args.tower_insulator_min_height_ratio), 0.0), 1.0)
+    z_min = -half_size[2] + (2.0 * half_size[2]) * height_ratio - z_margin
+    z_max = half_size[2] + z_margin
+    mask = (
+        (np.abs(local[:, 0]) <= half_size[0] + xy_margin)
+        & (np.abs(local[:, 1]) <= half_size[1] + xy_margin)
+        & (local[:, 2] >= z_min)
+        & (local[:, 2] <= z_max)
+    )
+    return int(np.count_nonzero(mask))
+
+
+def bridged_insulator_points_near_tower(insulator_coord, line_tree, tower_box, args):
+    if insulator_coord.shape[0] == 0 or line_tree is None or tower_box is None:
+        return {"nearby": 0, "bridged": 0}
+
+    center = tower_box["center"]
+    axes = tower_box["axes"]
+    half_size = tower_box["half_size"]
+    local = (insulator_coord - center[None, :]) @ axes.T
+
+    xy_margin = float(args.tower_insulator_xy_margin)
+    z_margin = float(args.tower_insulator_z_margin)
+    height_ratio = min(max(float(args.tower_insulator_min_height_ratio), 0.0), 1.0)
+    z_min = -half_size[2] + (2.0 * half_size[2]) * height_ratio - z_margin
+    z_max = half_size[2] + z_margin
+    nearby_mask = (
+        (np.abs(local[:, 0]) <= half_size[0] + xy_margin)
+        & (np.abs(local[:, 1]) <= half_size[1] + xy_margin)
+        & (local[:, 2] >= z_min)
+        & (local[:, 2] <= z_max)
+    )
+    nearby = insulator_coord[nearby_mask]
+    if nearby.shape[0] == 0:
+        return {"nearby": 0, "bridged": 0}
+
+    distance, _ = line_tree.query(nearby, k=1)
+    bridged = int(np.count_nonzero(distance <= float(args.insulator_line_radius)))
+    return {"nearby": int(nearby.shape[0]), "bridged": bridged}
+
+
+def filter_towers_by_insulator_line_bridge(
+    components, towers, tower_box_list, coord, cls, args
+):
+    if not args.require_insulator_line_bridge:
+        return towers, tower_box_list, 0
+
+    insulator_coord = coord[cls == args.insulator_class]
+    line_coord = coord[cls == args.line_class]
+    line_tree = cKDTree(line_coord) if line_coord.shape[0] else None
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        stats = bridged_insulator_points_near_tower(insulator_coord, line_tree, box, args)
+        tower["nearby_insulator_points"] = int(stats["nearby"])
+        tower["bridged_insulator_points"] = int(stats["bridged"])
+        if stats["bridged"] >= int(args.min_bridged_insulator_points):
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_insulator_line_bridge"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def filter_towers_by_insulator(components, towers, tower_box_list, coord, cls, args):
+    if not args.require_insulator_near_tower:
+        return towers, tower_box_list, 0
+
+    insulator_coord = coord[cls == args.insulator_class]
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        insulator_count = count_insulator_points_near_tower_box(
+            insulator_coord, box, args
+        )
+        tower["nearby_insulator_points"] = int(insulator_count)
+        if insulator_count >= int(args.min_insulator_points_near_tower):
+            kept_towers.append(tower)
+            continue
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_nearby_insulator"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def count_line_points_near_tower_top(line_coord, tower, args):
+    if line_coord.shape[0] == 0:
+        return {
+            "count": 0,
+            "top_z": float(tower["bbox_max"][2]),
+            "z_min": float(tower["bbox_max"][2]),
+            "z_max": float(tower["bbox_max"][2]),
+        }
+
+    xy_margin = float(args.tower_top_line_xy_margin)
+    top_z = float(tower["bbox_max"][2])
+    z_min = top_z - float(args.tower_top_line_z_below)
+    z_max = top_z + float(args.tower_top_line_z_above)
+    xy_min = tower["bbox_min"][:2] - xy_margin
+    xy_max = tower["bbox_max"][:2] + xy_margin
+    mask = (
+        (line_coord[:, 0] >= xy_min[0])
+        & (line_coord[:, 0] <= xy_max[0])
+        & (line_coord[:, 1] >= xy_min[1])
+        & (line_coord[:, 1] <= xy_max[1])
+        & (line_coord[:, 2] >= z_min)
+        & (line_coord[:, 2] <= z_max)
+    )
+    return {
+        "count": int(np.count_nonzero(mask)),
+        "top_z": top_z,
+        "z_min": float(z_min),
+        "z_max": float(z_max),
+    }
+
+
+def filter_towers_by_top_line(components, towers, tower_box_list, coord, cls, args):
+    if not args.require_tower_top_line:
+        return towers, tower_box_list, 0
+
+    line_coord = coord[cls == args.line_class]
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        stats = count_line_points_near_tower_top(line_coord, tower, args)
+        tower["top_line_points"] = int(stats["count"])
+        tower["tower_top_z"] = float(stats["top_z"])
+        tower["tower_top_line_z_min"] = float(stats["z_min"])
+        tower["tower_top_line_z_max"] = float(stats["z_max"])
+        if stats["count"] >= int(args.min_tower_top_line_points):
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_top_line"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
+
+
+def upper_tower_spread(points, tower_box, args):
+    empty = {
+        "upper_point_count": 0,
+        "upper_width": 0.0,
+        "upper_length": 0.0,
+        "upper_area": 0.0,
+    }
+    if points.shape[0] == 0 or tower_box is None:
+        return empty
+
+    center = tower_box["center"]
+    axes = tower_box["axes"]
+    half_size = tower_box["half_size"]
+    local = (points - center[None, :]) @ axes.T
+    ratio = min(max(float(args.bare_pole_upper_height_ratio), 0.0), 1.0)
+    z_min = -half_size[2] + (2.0 * half_size[2]) * ratio
+    upper = local[local[:, 2] >= z_min]
+    if upper.shape[0] == 0:
+        return empty
+
+    spread_0 = float(np.ptp(upper[:, 0]))
+    spread_1 = float(np.ptp(upper[:, 1]))
+    return {
+        "upper_point_count": int(upper.shape[0]),
+        "upper_width": float(max(spread_0, spread_1)),
+        "upper_length": float(min(spread_0, spread_1)),
+        "upper_area": float(spread_0 * spread_1),
+    }
+
+
+def filter_bare_pole_towers(
+    components, towers, tower_box_list, coord, tower_indices, point_comp, args
+):
+    if not args.remove_bare_pole_towers:
+        return towers, tower_box_list, 0
+
+    box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        box = box_by_id.get(int(tower["id"]))
+        points = points_for_tower(
+            coord, tower_indices, point_comp, tower["component_ids"]
+        )
+        spread = upper_tower_spread(points, box, args)
+        tower.update(spread)
+
+        is_bare_pole = (
+            spread["upper_point_count"] < int(args.min_upper_tower_points)
+            or spread["upper_width"] < float(args.min_upper_tower_width)
+            or spread["upper_area"] < float(args.min_upper_tower_area)
+        )
+        if not is_bare_pole:
+            kept_towers.append(tower)
+            continue
+
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_bare_pole"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    return kept_towers, kept_boxes, removed_count
 
 
 def main_axis_xy(centers):
@@ -1004,6 +2045,21 @@ def line_span_boxes(coord, cls, towers, tower_box_by_id, args):
         selected = line_indices[mask]
         if selected.size < args.min_span_line_points:
             continue
+        if args.require_connected_line_span:
+            selected_proj = proj[mask]
+            end_window = max(float(args.span_end_contact_window), 0.0)
+            min_end_points = int(args.min_span_end_contact_points)
+            left_end_count = int(
+                np.count_nonzero(selected_proj <= span_start + end_window)
+            )
+            right_end_count = int(
+                np.count_nonzero(selected_proj >= span_end - end_window)
+            )
+            if left_end_count < min_end_points or right_end_count < min_end_points:
+                continue
+        else:
+            left_end_count = 0
+            right_end_count = 0
         box = {
             "kind": "line_span",
             "span_id": int(span_id),
@@ -1012,6 +2068,8 @@ def line_span_boxes(coord, cls, towers, tower_box_by_id, args):
             "left_tower_name": left.get("display_name", left.get("name", "")),
             "right_tower_name": right.get("display_name", right.get("name", "")),
             "line_point_count": int(selected.size),
+            "left_end_contact_points": int(left_end_count),
+            "right_end_contact_points": int(right_end_count),
             "_line_indices": selected,
             "_p0_xy": p0,
             "_direction_xy": direction,
@@ -1039,6 +2097,76 @@ def line_span_boxes(coord, cls, towers, tower_box_by_id, args):
             box.update({"box_mode": "axis", "bbox_min": lo, "bbox_max": hi})
         boxes.append(box)
     return boxes
+
+
+def filter_towers_by_connected_line_span(
+    components, towers, tower_box_list, coord, cls, args
+):
+    if not args.require_connected_line_span:
+        return towers, tower_box_list, 0, []
+
+    tower_box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
+    span_boxes = line_span_boxes(coord, cls, towers, tower_box_by_id, args)
+    connected_ids = set()
+    for span in span_boxes:
+        left = next(
+            (tower for tower in towers if int(tower["id"]) == int(span["left_tower_id"])),
+            None,
+        )
+        right = next(
+            (tower for tower in towers if int(tower["id"]) == int(span["right_tower_id"])),
+            None,
+        )
+        min_touch = int(args.min_line_points_touch_tower)
+        left_touch_ok = (
+            not args.require_line_touch_tower
+            or int(left.get("touch_line_points", 0)) >= min_touch
+        ) if left is not None else False
+        right_touch_ok = (
+            not args.require_line_touch_tower
+            or int(right.get("touch_line_points", 0)) >= min_touch
+        ) if right is not None else False
+        if left is not None and left_touch_ok:
+            connected_ids.add(int(span["left_tower_id"]))
+        if right is not None and right_touch_ok:
+            connected_ids.add(int(span["right_tower_id"]))
+
+    for tower in towers:
+        tower["connected_span_count"] = 0
+    tower_by_id = {int(tower["id"]): tower for tower in towers}
+    for span in span_boxes:
+        left = tower_by_id.get(int(span["left_tower_id"]))
+        right = tower_by_id.get(int(span["right_tower_id"]))
+        if left is not None and int(left["id"]) in connected_ids:
+            left["connected_span_count"] = int(left.get("connected_span_count", 0)) + 1
+        if right is not None and int(right["id"]) in connected_ids:
+            right["connected_span_count"] = int(right.get("connected_span_count", 0)) + 1
+
+    kept_towers = []
+    removed_component_ids = set()
+    removed_count = 0
+    for tower in towers:
+        if int(tower["id"]) in connected_ids:
+            kept_towers.append(tower)
+            continue
+        removed_count += 1
+        removed_component_ids.update(int(item) for item in tower["component_ids"])
+
+    if removed_component_ids:
+        for comp in components:
+            if int(comp["id"]) in removed_component_ids:
+                comp["keep"] = False
+                comp["remove_reason"] = "physical_tower_no_connected_line_span"
+
+    kept_ids = {int(tower["id"]) for tower in kept_towers}
+    kept_boxes = [box for box in tower_box_list if int(box["tower_id"]) in kept_ids]
+    kept_spans = [
+        span
+        for span in span_boxes
+        if int(span["left_tower_id"]) in kept_ids
+        and int(span["right_tower_id"]) in kept_ids
+    ]
+    return kept_towers, kept_boxes, removed_count, kept_spans
 
 
 def cross_section_clusters(cross_coord, radius, min_points):
@@ -1410,6 +2538,7 @@ def json_ready_component(comp):
         "size": comp["size"].tolist(),
         "center": comp["center"].tolist(),
         "nearby_line_points": int(comp.get("nearby_line_points", 0)),
+        "through_line_points": int(comp.get("through_line_points", 0)),
         "height_above_ground": (
             None
             if comp.get("height_above_ground") is None
@@ -1428,6 +2557,43 @@ def json_ready_tower(tower):
         "display_name": tower.get("display_name", ""),
         "component_ids": [int(item) for item in tower["component_ids"]],
         "point_count": int(tower["point_count"]),
+        "through_line_points": int(tower.get("through_line_points", 0)),
+        "through_line_points_before": int(tower.get("through_line_points_before", 0)),
+        "through_line_points_after": int(tower.get("through_line_points_after", 0)),
+        "touch_line_points": int(tower.get("touch_line_points", 0)),
+        "inside_tower_line_points": int(tower.get("inside_tower_line_points", 0)),
+        "continuous_inside_line_points": int(tower.get("continuous_inside_line_points", 0)),
+        "continuous_inside_line_bins": int(tower.get("continuous_inside_line_bins", 0)),
+        "continuous_inside_line_max_run_bins": int(
+            tower.get("continuous_inside_line_max_run_bins", 0)
+        ),
+        "continuous_inside_line_max_run_length": float(
+            tower.get("continuous_inside_line_max_run_length", 0.0)
+        ),
+        "side_line_left_points": int(tower.get("side_line_left_points", 0)),
+        "side_line_right_points": int(tower.get("side_line_right_points", 0)),
+        "side_line_points": int(tower.get("side_line_points", 0)),
+        "connected_span_count": int(tower.get("connected_span_count", 0)),
+        "line_touch_min_distance": (
+            None
+            if tower.get("line_touch_min_distance") is None
+            else float(tower["line_touch_min_distance"])
+        ),
+        "line_touch_radius": float(tower.get("line_touch_radius", 0.0)),
+        "top_line_points": int(tower.get("top_line_points", 0)),
+        "tower_top_z": float(tower.get("tower_top_z", tower["bbox_max"][2])),
+        "tower_top_line_z_min": float(
+            tower.get("tower_top_line_z_min", tower["bbox_max"][2])
+        ),
+        "tower_top_line_z_max": float(
+            tower.get("tower_top_line_z_max", tower["bbox_max"][2])
+        ),
+        "nearby_insulator_points": int(tower.get("nearby_insulator_points", 0)),
+        "bridged_insulator_points": int(tower.get("bridged_insulator_points", 0)),
+        "upper_point_count": int(tower.get("upper_point_count", 0)),
+        "upper_width": float(tower.get("upper_width", 0.0)),
+        "upper_length": float(tower.get("upper_length", 0.0)),
+        "upper_area": float(tower.get("upper_area", 0.0)),
         "bbox_min": tower["bbox_min"].tolist(),
         "bbox_max": tower["bbox_max"].tolist(),
         "size": tower["size"].tolist(),
@@ -1453,19 +2619,20 @@ def drawable_box_item(box, id_fields):
     return item
 
 
-def make_standard_tower_boxes(tower_box_list, origin):
+def make_standard_tower_boxes(tower_box_list, origin, orientation):
     return [
         box_to_obb_record(
             box,
             class_name="tower",
             instance_name=f"杆塔{int(box.get('tower_no', 0))}",
             origin=origin,
+            orientation=orientation,
         )
         for box in sorted(tower_box_list, key=lambda item: int(item.get("tower_no", 0)))
     ]
 
 
-def make_standard_line_boxes(span_boxes, origin):
+def make_standard_line_boxes(span_boxes, origin, orientation):
     return [
         box_to_obb_record(
             span,
@@ -1476,6 +2643,7 @@ def make_standard_line_boxes(span_boxes, origin):
                 span.get("right_tower_name", ""),
             ),
             origin=origin,
+            orientation=orientation,
         )
         for index, span in enumerate(
             sorted(span_boxes, key=lambda item: int(item["span_id"])), start=1
@@ -1558,30 +2726,73 @@ def rotation_matrix_to_quaternion(matrix):
     return (quat / norm).tolist()
 
 
-def box_to_obb_record(box, class_name, instance_name, origin):
-    if box.get("box_mode") == "oriented":
+def north_relative_rotation_from_axes(axes):
+    """Return rotation from a north-facing OBB basis to fitted axes.
+
+    The fitted box stores axes as row vectors: local length, local width, local Z.
+    A north-facing box is defined as length=LAS X+, width=LAS Y+, Z=up, so that
+    boxes already facing north export identity rotation.
+    """
+    fitted_rotation = np.asarray(axes, dtype=np.float64).T
+    north_axes = local_axes_from_direction(np.array([1.0, 0.0], dtype=np.float64))
+    north_rotation = north_axes.T
+    relative_rotation = fitted_rotation @ north_rotation.T
+    return rotation_matrix_to_quaternion(relative_rotation)
+
+
+def box_to_obb_record(box, class_name, instance_name, origin, orientation="fitted"):
+    if orientation == "north":
+        corners, _ = box_geometry_from_box(box)
+        bbox_min = corners.min(axis=0)
+        bbox_max = corners.max(axis=0)
+        center = (bbox_min + bbox_max) / 2.0
+        size_x = float(bbox_max[0] - bbox_min[0])
+        size_y = float(bbox_max[1] - bbox_min[1])
+        height = float(bbox_max[2] - bbox_min[2])
+        extent = np.array([size_x, size_y, height], dtype=np.float64)
+        rotation = [0.0, 0.0, 0.0, 1.0]
+        extent_order = ["north_x_length", "side_y_width", "height"]
+    elif box.get("box_mode") == "oriented":
         center = box["center"].astype(np.float64, copy=False)
         extent = (box["half_size"] * 2.0).astype(np.float64, copy=False)
-        rotation = rotation_matrix_to_quaternion(box["axes"].T)
+        axes = box["axes"]
+        if box.get("kind") == "line_span":
+            # For span JSON, the tower-to-tower direction is the box width axis.
+            # Use -side, along, up to keep a right-handed local coordinate frame.
+            axes = np.vstack([-axes[1], axes[0], axes[2]])
+            extent = extent[[1, 0, 2]]
+            extent_order = [
+                "local_x_length_cross_span",
+                "local_y_width_between_towers",
+                "local_z_height",
+            ]
+        else:
+            extent_order = ["local_x_length", "local_y_width", "local_z_height"]
+        rotation = north_relative_rotation_from_axes(axes)
     else:
         center = (box["bbox_min"] + box["bbox_max"]) / 2.0
         extent = box["bbox_max"] - box["bbox_min"]
         rotation = [0.0, 0.0, 0.0, 1.0]
+        extent_order = ["x", "y", "z"]
     origin = np.asarray(origin, dtype=np.float64)
     relative_center = center - origin
     relative_center_list = relative_center.tolist()
+    center_list = center.tolist()
     origin_list = origin.tolist()
     extent_list = extent.tolist()
-    return {
+    record = {
         "class_name": class_name,
         "instance_name": instance_name,
         "obb": relative_center_list + extent_list + rotation,
         "obb_global": {
             "extent": extent_list,
-            "lat_lng_alt": origin_list,
+            "extent_order": extent_order,
+            "lat_lng_alt": center_list,
+            "las_origin": origin_list,
             "rotation": rotation,
         },
     }
+    return record
 
 
 def write_json(path, data):
@@ -1599,7 +2810,12 @@ def resolve_obb_origin(las, args):
         return np.asarray(las.header.mins, dtype=np.float64)
     if args.obb_origin == "zero":
         return np.zeros(3, dtype=np.float64)
-    return np.asarray(las.header.offsets, dtype=np.float64)
+    origin = np.asarray(las.header.offsets, dtype=np.float64)
+    header_mins = np.asarray(las.header.mins, dtype=np.float64)
+    header_maxs = np.asarray(las.header.maxs, dtype=np.float64)
+    if np.all((origin >= header_mins) & (origin <= header_maxs)):
+        return origin
+    return (header_mins + header_maxs) / 2.0
 
 
 def main():
@@ -1665,6 +2881,79 @@ def main():
     )
     physical_towers = merge_physical_towers(components, args)
     physical_towers = assign_tower_names(physical_towers, args)
+    initial_tower_boxes = tower_boxes(
+        physical_towers, coord, tower_indices, point_comp, args.tower_box_margin
+    )
+    physical_towers, initial_tower_boxes, removed_physical_towers = (
+        filter_towers_by_line_through_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_no_touch_towers = (
+        filter_towers_by_line_touch_box(
+            components,
+            physical_towers,
+            initial_tower_boxes,
+            coord,
+            cls,
+            tower_indices,
+            point_comp,
+            args,
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_no_top_line_towers = (
+        filter_towers_by_top_line(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_inside_line_towers = (
+        filter_towers_by_line_inside_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_noncontinuous_line_towers = (
+        filter_towers_by_continuous_line_inside_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_no_side_line_towers = (
+        filter_towers_by_side_line_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_insulatorless_towers = (
+        filter_towers_by_insulator(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_unbridged_insulator_towers = (
+        filter_towers_by_insulator_line_bridge(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_bare_pole_towers = (
+        filter_bare_pole_towers(
+            components,
+            physical_towers,
+            initial_tower_boxes,
+            coord,
+            tower_indices,
+            point_comp,
+            args,
+        )
+    )
+    physical_towers = assign_tower_names(physical_towers, args)
+    physical_towers, initial_tower_boxes, removed_unconnected_span_towers, _ = (
+        filter_towers_by_connected_line_span(
+            components,
+            physical_towers,
+            initial_tower_boxes,
+            coord,
+            cls,
+            args,
+        )
+    )
+    physical_towers = assign_tower_names(physical_towers, args)
     removed_indices = apply_tower_cleanup(
         las, cls, tower_indices, point_comp, components, args.background_class
     )
@@ -1680,6 +2969,56 @@ def main():
     if recovered_base_components:
         print(
             f"Recovered {recovered_base_components} low tower-base components",
+            flush=True,
+        )
+    if removed_physical_towers:
+        print(
+            f"Removed {removed_physical_towers} physical towers without through-line",
+            flush=True,
+        )
+    if removed_no_touch_towers:
+        print(
+            f"Removed {removed_no_touch_towers} physical towers without line touch",
+            flush=True,
+        )
+    if removed_no_top_line_towers:
+        print(
+            f"Removed {removed_no_top_line_towers} physical towers without top line",
+            flush=True,
+        )
+    if removed_inside_line_towers:
+        print(
+            f"Removed {removed_inside_line_towers} physical towers with too few inside line points",
+            flush=True,
+        )
+    if removed_noncontinuous_line_towers:
+        print(
+            f"Removed {removed_noncontinuous_line_towers} physical towers without continuous inside line",
+            flush=True,
+        )
+    if removed_no_side_line_towers:
+        print(
+            f"Removed {removed_no_side_line_towers} physical towers without side line",
+            flush=True,
+        )
+    if removed_insulatorless_towers:
+        print(
+            f"Removed {removed_insulatorless_towers} physical towers without nearby insulator",
+            flush=True,
+        )
+    if removed_unbridged_insulator_towers:
+        print(
+            f"Removed {removed_unbridged_insulator_towers} physical towers without insulator-line bridge",
+            flush=True,
+        )
+    if removed_bare_pole_towers:
+        print(
+            f"Removed {removed_bare_pole_towers} bare-pole physical towers",
+            flush=True,
+        )
+    if removed_unconnected_span_towers:
+        print(
+            f"Removed {removed_unconnected_span_towers} physical towers without connected line span",
             flush=True,
         )
 
@@ -1743,6 +3082,20 @@ def main():
         "physical_towers": [json_ready_tower(tower) for tower in physical_towers],
         "physical_tower_count": len(physical_towers),
         "recovered_tower_base_components": int(recovered_base_components),
+        "removed_physical_towers_without_through_line": int(removed_physical_towers),
+        "removed_physical_towers_without_line_touch": int(removed_no_touch_towers),
+        "removed_physical_towers_without_top_line": int(removed_no_top_line_towers),
+        "removed_physical_towers_with_too_few_inside_line_points": int(removed_inside_line_towers),
+        "removed_physical_towers_without_continuous_inside_line": int(
+            removed_noncontinuous_line_towers
+        ),
+        "removed_physical_towers_without_side_line": int(removed_no_side_line_towers),
+        "removed_physical_towers_without_nearby_insulator": int(removed_insulatorless_towers),
+        "removed_physical_towers_without_insulator_line_bridge": int(
+            removed_unbridged_insulator_towers
+        ),
+        "removed_bare_pole_physical_towers": int(removed_bare_pole_towers),
+        "removed_physical_towers_without_connected_line_span": int(removed_unconnected_span_towers),
         "removed_tower_points": int(removed_indices.size),
         "conductors": debug_conductor_reports,
         "conductor_count": len(conductor_reports),
@@ -1753,13 +3106,18 @@ def main():
         "appended_box_edge_points": appended_points,
         "obb_origin_mode": args.obb_origin,
         "obb_origin_xyz": obb_origin.tolist(),
+        "json_box_orientation": args.json_box_orientation,
         "elapsed_sec": round(elapsed, 3),
         "parameters": vars(args),
     }
     tower_box_report = make_standard_tower_boxes(
-        [box for box in boxes if box["kind"] == "tower"], obb_origin
+        [box for box in boxes if box["kind"] == "tower"],
+        obb_origin,
+        args.json_box_orientation,
     )
-    line_box_report = make_standard_line_boxes(span_boxes, obb_origin)
+    line_box_report = make_standard_line_boxes(
+        span_boxes, obb_origin, args.json_box_orientation
+    )
     combined_box_report = tower_box_report + line_box_report
     conductor_render_report = make_conductor_render_report(
         conductor_reports, obb_origin
@@ -1784,10 +3142,10 @@ if __name__ == "__main__":
     main()
 
 """ 
-/opt/conda/envs/pointcept/bin/python tools/postprocess_tower_line_boxes.py \
-  --input /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb_plain_v1.las \
-  --output /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb_tower_line_boxes_v3.las \
-  --report /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb_tower_line_boxes_v3_report.json \
+python tools/infer/postprocess_tower_line_boxes.py \
+  --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick.las \
+  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_output.las \
+  --report /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_report.json \
   --tower-voxel-size 0.50 \
   --min-tower-points 50000 \
   --min-tower-height 30.0 \
@@ -1802,5 +3160,47 @@ if __name__ == "__main__":
   --tower-box-margin 1.0 \
   --line-box-margin 1.0 \
   --edge-step 0.30 \
+  --json-box-orientation fitted \
   --overwrite
+  
+  python tools/infer/postprocess_tower_line_boxes.py \
+  --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick.las \
+  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_v1.las \
+  --report /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_v1.json \
+  --require-insulator-line-bridge \
+  --tower-insulator-xy-margin 6.0 \
+  --tower-insulator-z-margin 6.0 \
+  --tower-insulator-min-height-ratio 0.35 \
+  --insulator-line-radius 1.2 \
+  --min-bridged-insulator-points 20 \
+  --json-box-orientation fitted \
+  --overwrite
+  
+  
+  旧的
+  python tools/infer/postprocess_tower_line_boxes.py \
+   --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_plain_v1.las \
+  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_plain_v1_outPut.las \
+  --report /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_plain_v1_report.json \
+  --min-tower-height 6.0 \
+  --min-tower-points 200 \
+  --min-tower-height-above-ground 4.0 \
+  --require-tower-top-line \
+  --tower-top-line-xy-margin 6.0 \
+  --tower-top-line-z-below 5.0 \
+  --tower-top-line-z-above 8.0 \
+  --min-tower-top-line-points 30 \
+  --merge-tower-xy-radius 10.0 \
+  --line-corridor-width 20.0 \
+  --min-span-line-points 200 \
+  --json-box-orientation fitted \
+  --overwrite
+"""
+""" 
+
+    
+    
+    
+    
+    
 """

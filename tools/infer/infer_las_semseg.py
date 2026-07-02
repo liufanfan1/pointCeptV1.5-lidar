@@ -15,7 +15,11 @@ import time
 from collections import OrderedDict
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+SCRIPT_PATH = Path(__file__).resolve()
+ROOT_DIR = next(
+    (path for path in SCRIPT_PATH.parents if (path / "pointcept").is_dir()),
+    SCRIPT_PATH.parents[2],
+)
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
@@ -47,6 +51,58 @@ CLASS_COLOR_8BIT = np.array(
     ],
     dtype=np.uint8,
 )
+
+
+def format_seconds(seconds):
+    seconds = float(seconds)
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m{sec:05.2f}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{int(hours)}h{int(minutes):02d}m{sec:05.2f}s"
+
+
+def format_bytes(num_bytes):
+    value = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024.0 or unit == "TB":
+            return f"{value:.2f}{unit}"
+        value /= 1024.0
+
+
+def is_cuda_device(device):
+    return isinstance(device, torch.device) and device.type == "cuda"
+
+
+def sync_cuda(device):
+    if is_cuda_device(device):
+        torch.cuda.synchronize(device)
+
+
+def reset_cuda_peak_memory(device):
+    if is_cuda_device(device):
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def cuda_peak_memory_summary(device):
+    if not is_cuda_device(device):
+        return "cuda_peak_allocated=N/A, cuda_peak_reserved=N/A"
+    return (
+        "cuda_peak_allocated={}, cuda_peak_reserved={}".format(
+            format_bytes(torch.cuda.max_memory_allocated(device)),
+            format_bytes(torch.cuda.max_memory_reserved(device)),
+        )
+    )
+
+
+def new_infer_stats():
+    return {
+        "total_tiles": 0,
+        "processed_tiles": 0,
+        "skipped_tiles": 0,
+    }
 
 
 def parse_args():
@@ -524,9 +580,13 @@ def infer_las_tiled(
     pre_voxel_size,
     merge_mode="plain",
     context_margin=0.0,
+    stats=None,
 ):
     if tile_size <= 0 or coord.shape[0] <= pipeline["crop"].point_max:
         print(f"  infer whole cloud: {coord.shape[0]} points", flush=True)
+        if stats is not None:
+            stats["total_tiles"] += 1
+            stats["processed_tiles"] += 1
         return infer_tile_points(
             model, cfg, pipeline, coord, color, device, fragment_batch_size, pre_voxel_size
         )
@@ -542,6 +602,8 @@ def infer_las_tiled(
     if merge_mode in ("halo", "overlap"):
         x_starts, y_starts = tile_grid_bounds(coord, tile_size, tile_stride)
         total_tiles = len(x_starts) * len(y_starts)
+        if stats is not None:
+            stats["total_tiles"] += int(total_tiles)
         used_tiles = 0
         done = np.zeros(coord.shape[0], dtype=bool)
         if merge_mode == "overlap":
@@ -572,12 +634,18 @@ def infer_las_tiled(
                     write_mask = infer_mask
                 infer_indices = np.flatnonzero(infer_mask)
                 if infer_indices.size < min_tile_points:
+                    if stats is not None:
+                        stats["skipped_tiles"] += 1
                     continue
                 if merge_mode == "halo":
                     local_write = np.flatnonzero(write_mask[infer_indices])
                     if local_write.size == 0:
+                        if stats is not None:
+                            stats["skipped_tiles"] += 1
                         continue
                 used_tiles += 1
+                if stats is not None:
+                    stats["processed_tiles"] += 1
                 tile_start = time.perf_counter()
                 print(
                     f"  tile {tile_idx}/{total_tiles}: infer={infer_indices.size} "
@@ -625,6 +693,8 @@ def infer_las_tiled(
             coord, tile_size
         )
         total_tiles = x_count * y_count
+        if stats is not None:
+            stats["total_tiles"] += int(total_tiles)
         print(
             f"  tile inference: {coord.shape[0]} points, "
             f"{x_count} x {y_count} = {total_tiles} tiles, "
@@ -636,8 +706,12 @@ def infer_las_tiled(
             zip(unique_id, starts, counts), start=1
         ):
             if count < min_tile_points:
+                if stats is not None:
+                    stats["skipped_tiles"] += 1
                 continue
             used_tiles += 1
+            if stats is not None:
+                stats["processed_tiles"] += 1
             indices = order[start : start + count]
             ix = int(tile_id // y_count)
             iy = int(tile_id % y_count)
@@ -667,6 +741,8 @@ def infer_las_tiled(
         x_starts = tile_starts(float(coord[:, 0].min()), float(coord[:, 0].max()), tile_size, tile_stride)
         y_starts = tile_starts(float(coord[:, 1].min()), float(coord[:, 1].max()), tile_size, tile_stride)
         total_tiles = len(x_starts) * len(y_starts)
+        if stats is not None:
+            stats["total_tiles"] += int(total_tiles)
         tile_idx = 0
         print(
             f"  tile inference: {coord.shape[0]} points, "
@@ -684,8 +760,12 @@ def infer_las_tiled(
                 mask = x_mask & (coord[:, 1] >= y0) & (coord[:, 1] <= y1)
                 indices = np.flatnonzero(mask)
                 if indices.size < min_tile_points:
+                    if stats is not None:
+                        stats["skipped_tiles"] += 1
                     continue
                 used_tiles += 1
+                if stats is not None:
+                    stats["processed_tiles"] += 1
                 tile_start = time.perf_counter()
                 print(
                     f"  tile {tile_idx}/{total_tiles}: {indices.size} points "
@@ -744,16 +824,24 @@ def main():
     if not jobs:
         raise FileNotFoundError(f"No .las files found under: {input_path}")
 
+    all_start = time.perf_counter()
+    all_stats = new_infer_stats()
     for source_path, target_path in jobs:
         if target_path.exists() and not args.overwrite:
             raise FileExistsError(f"Output exists, use --overwrite: {target_path}")
+        job_start = time.perf_counter()
+        reset_cuda_peak_memory(device)
         print(f"Reading {source_path}", flush=True)
         read_start = time.perf_counter()
         coord, color, las = read_las(source_path, args.default_color, args.las_backend)
+        read_time = time.perf_counter() - read_start
         print(
-            f"Loaded {coord.shape[0]} points in {time.perf_counter() - read_start:.2f}s",
+            f"Loaded {coord.shape[0]} points in {read_time:.2f}s",
             flush=True,
         )
+        infer_stats = new_infer_stats()
+        sync_cuda(device)
+        infer_start = time.perf_counter()
         pred = infer_las_tiled(
             model=model,
             cfg=cfg,
@@ -768,16 +856,55 @@ def main():
             pre_voxel_size=args.pre_voxel_size,
             merge_mode=args.merge_mode,
             context_margin=args.context_margin,
+            stats=infer_stats,
         )
+        sync_cuda(device)
+        infer_time = time.perf_counter() - infer_start
         write_start = time.perf_counter()
         write_las(source_path, target_path, las, pred, colorize=not args.no_colorize)
-        print(f"Wrote LAS in {time.perf_counter() - write_start:.2f}s", flush=True)
+        write_time = time.perf_counter() - write_start
+        print(f"Wrote LAS in {write_time:.2f}s", flush=True)
         counts = np.bincount(pred, minlength=cfg.data.num_classes)
         summary = ", ".join(
             f"{idx}:{cfg.data.names[idx]}={int(counts[idx])}"
             for idx in range(cfg.data.num_classes)
         )
         print(f"Saved {target_path} ({coord.shape[0]} points; {summary})")
+        for key in all_stats:
+            all_stats[key] += int(infer_stats[key])
+        processed_tiles = int(infer_stats["processed_tiles"])
+        total_tiles = int(infer_stats["total_tiles"])
+        skipped_tiles = max(total_tiles - processed_tiles, 0)
+        job_time = time.perf_counter() - job_start
+        print(
+            "Timing summary: total={}, read={}, inference={}, write={}, "
+            "tiles_processed={}, tiles_total={}, tiles_skipped={}, {}".format(
+                format_seconds(job_time),
+                format_seconds(read_time),
+                format_seconds(infer_time),
+                format_seconds(write_time),
+                processed_tiles,
+                total_tiles,
+                skipped_tiles,
+                cuda_peak_memory_summary(device),
+            ),
+            flush=True,
+        )
+
+    if len(jobs) > 1:
+        total_processed = int(all_stats["processed_tiles"])
+        total_tiles = int(all_stats["total_tiles"])
+        print(
+            "All jobs summary: files={}, total_time={}, tiles_processed={}, "
+            "tiles_total={}, tiles_skipped={}".format(
+                len(jobs),
+                format_seconds(time.perf_counter() - all_start),
+                total_processed,
+                total_tiles,
+                max(total_tiles - total_processed, 0),
+            ),
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
@@ -808,7 +935,7 @@ python tools/infer_las_semseg.py \
     
       1. 当前模式 plain
 
-  python tools/infer_las_semseg.py \
+  python tools/infer/infer_las_semseg.py \
     --input /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb009b5736892392a_v2.las \
     --output /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb_plain_v1.las \
     --merge-mode plain \
@@ -819,9 +946,9 @@ python tools/infer_las_semseg.py \
 
   2. Halo 上下文模式，推荐优先试
 
-  python tools/infer_las_semseg.py \
-    --input /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb009b5736892392a.las \
-    --output /24085403037/24085403037/shixi/dataset/6_23_demo/cloudb_plain_v1.las \
+  python tools/infer/infer_las_semseg.py \
+    --input /24085403037/24085403037/shixi/dataset/6_23_demo/lidar/youhangshudian.las \
+    --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/youhangshudian.las \
     --merge-mode halo \
     --tile-size 40 \
     --tile-stride 40 \
