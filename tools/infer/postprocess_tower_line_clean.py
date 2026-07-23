@@ -1,25 +1,23 @@
-"""Clean tower false positives and add tower/line-span boxes to segmented LAS.
+"""清理输电线路四分类 LAS 中的杆塔误检。
 
-Input is a LAS produced by tools/infer_las_semseg.py:
+输入 classification 约定：
+    0=background, 1=tower, 2=line, 3=insulator
 
-    classification 0=background, 1=tower, 2=line, 3=insulator
+本脚本是拆分后处理流程的第 1 步：
+1. 删除旧的 class 30/31 可视化点；
+2. 对 class=1 的杆塔点做连通域聚类和关系过滤；
+3. 将误检杆塔点改回背景类别；
+4. 输出清理后的 LAS 和清理报告 JSON。
 
-The script:
-1. clusters predicted tower points into 3D connected components;
-2. removes components that are too small/flat, optionally without nearby line;
-3. appends sampled box-edge points around each retained tower;
-4. sorts retained towers along the main XY direction and appends one box around
-   line points between each adjacent tower pair.
-
-The output LAS keeps original points and appends synthetic edge points with
-classification=31. RGB is recolored when the LAS point format supports RGB.
+本脚本不生成杆塔框、档距框、拟合导线，也不追加 class 30/31 可视化点。
+后续画框请使用 tools/box_lineAndTower/draw_tower_line_boxes.py。
 """
-# 后处理的脚本：
-# 清理杆塔误分：主要是对class=1的杆塔点做聚类，然后根据点数、高度、附近是否有导线等条件，把明显不像杆塔的小块过滤掉。
-# 恢复杆塔底部：会在真实杆塔底部附近找一些小组件，把它们恢复为杆塔的一部分，避免杆塔框底部缺失太严重。
-# 给每个杆塔生成框：从左到右依次生成OBB旋转框，杆塔1、2......
-# 给两个杆塔之间的整体线路段生成框。
-# 拟合每个档距里的每根导线
+# 清理阶段脚本：
+# 只负责修正四分类 LAS 的 classification，不负责画杆塔框、档距框和拟合导线。
+# 清理杆塔误分：主要对 class=1 的杆塔点做聚类，然后根据点数、高度、
+# 附近导线/绝缘子关系等条件，把明显不像杆塔的小块改回背景。
+# 恢复杆塔底部：会在真实杆塔底部附近找一些小组件，把它们恢复为杆塔的一部分，
+# 避免后续画框时杆塔底部缺失太严重。
 import argparse
 import json
 import time
@@ -35,10 +33,10 @@ laspy = None
 
 
 DEFAULT_CLASS_COLORS_16 = {
-    0: (37008, 37008, 37008),  # background / ground, gray
-    1: (58880, 16640, 14080),  # tower, red
-    2: (11520, 32000, 65280),  # line, blue
-    3: (65280, 53760, 10240),  # insulator, yellow
+    0: (37008, 37008, 37008),  # 背景/地面，灰色
+    1: (58880, 16640, 14080),  # 杆塔，红色
+    2: (11520, 32000, 65280),  # 导线，蓝色
+    3: (65280, 53760, 10240),  # 绝缘子，黄色
 }
 TOWER_BOX_COLOR_16 = np.array([65535, 0, 65535], dtype=np.uint16)
 LINE_BOX_COLOR_16 = np.array([0, 65535, 65535], dtype=np.uint16)
@@ -98,6 +96,16 @@ def parse_args():
             "false positives, box towers, and box line spans between towers."
         )
     )
+    parser.add_argument(
+        "--preset",
+        choices=("transmission-line", "legacy"),
+        default="transmission-line",
+        help=(
+            "Default workflow preset. transmission-line enables the integrated "
+            "tower/line/insulator filtering used by this project. legacy restores "
+            "the older loose defaults."
+        ),
+    )
     parser.add_argument("--input", required=True, help="Segmented input LAS/LAZ.")
     parser.add_argument("--output", required=True, help="Output LAS/LAZ.")
     parser.add_argument(
@@ -146,7 +154,7 @@ def parse_args():
             "obb_global.las_origin stores this origin. Default: LAS header offsets."
         ),
     )# 控制JSON中的OBB旋转框使用什么相对坐标原点
-    # las-offset  使用 LAS header offset，推荐
+    # las-offset  使用 LAS 文件头 offset，推荐
     # las-min     使用点云最小 xyz
     # zero        不用相对坐标，直接接近全局坐标
     # custom      自定义原点
@@ -174,6 +182,37 @@ def parse_args():
     parser.add_argument("--line-class", type=int, default=2)
     parser.add_argument("--insulator-class", type=int, default=3)
       # 类别定义
+    parser.add_argument(
+        "--no-remove-low-line-insulator",
+        dest="remove_low_line_insulator",
+        action="store_false",
+        help="关闭近地面导线/绝缘子清理。",
+    )
+    parser.set_defaults(remove_low_line_insulator=True)
+    parser.add_argument(
+        "--low-line-insulator-height",
+        type=float,
+        default=2.0,
+        help="导线/绝缘子点距离局部地面低于该高度时改回背景，单位为米。",
+    )
+    parser.add_argument(
+        "--low-line-insulator-ground-grid-size",
+        type=float,
+        default=2.0,
+        help="估计局部地面高度时使用的 XY 网格大小，单位为米。",
+    )
+    parser.add_argument(
+        "--low-line-insulator-ground-percentile",
+        type=float,
+        default=5.0,
+        help="每个地面网格内用于估计地面高度的背景点 Z 分位数。",
+    )
+    parser.add_argument(
+        "--low-line-insulator-global-ground-percentile",
+        type=float,
+        default=2.0,
+        help="候选点所在网格没有背景点时，用全局背景点 Z 分位数兜底。",
+    )
    
     parser.add_argument(
         "--tower-voxel-size",
@@ -193,13 +232,13 @@ def parse_args():
     parser.add_argument(
         "--min-tower-points",
         type=int,
-        default=500,
+        default=200,
         help="Remove tower components with fewer original points than this.",
     )# 杆塔组件最少点数。低于这个点数的杆塔候选框会被当做误检删掉
     parser.add_argument(
         "--min-tower-height",
         type=float,
-        default=4.0,
+        default=6.0,
         help="Remove tower components whose z height is lower than this many meters.",
     )# 杆塔组件的最小高度
     parser.add_argument(
@@ -211,18 +250,19 @@ def parse_args():
     parser.add_argument(
         "--require-line-near-tower",
         action="store_true",
+        default=True,
         help="Keep only tower components that have line points nearby.",
     )# 要求杆塔附近必须有导线点
     parser.add_argument(
         "--tower-line-radius",
         type=float,
-        default=8.0,
+        default=18.0,
         help="Radius in meters for --require-line-near-tower.",
     )# 判断“杆塔附近是否有导线”的搜索半径，单位为米.
     parser.add_argument(
         "--min-line-points-near-tower",
         type=int,
-        default=0,
+        default=100,
         help=(
             "Remove tower components with fewer line points than this inside "
             "--tower-line-radius. 0 disables this filter."
@@ -281,12 +321,19 @@ def parse_args():
     parser.add_argument(
         "--require-line-touch-tower",
         action="store_true",
+        default=True,
         help=(
             "Keep only physical towers whose upper tower points are close "
             "enough to line points in 3D. This removes towers below/near "
             "lines but not actually touched by lines."
         ),
-    )# 要求杆塔上部点和导线点在三维空间真正接近/接触，用于删除黄色框这种假塔。
+    )# 默认要求杆塔上部点和导线点在三维空间真正接近/接触。
+    parser.add_argument(
+        "--no-require-line-touch-tower",
+        dest="require_line_touch_tower",
+        action="store_false",
+        help="关闭杆塔与导线的三维接触过滤，仅用于兼容旧实验。",
+    )
     parser.add_argument(
         "--tower-line-contact-radius",
         type=float,
@@ -323,6 +370,24 @@ def parse_args():
         default=20,
         help="Minimum upper tower points close to line points required to keep a tower.",
     )# 杆塔上部至少有多少个点和导线点接近，才保留该杆塔。
+    parser.add_argument(
+        "--line-contact-voxel-size",
+        type=float,
+        default=0.50,
+        help="验证连续线路组件时使用的三维体素大小，单位为米。",
+    )
+    parser.add_argument(
+        "--min-contact-line-component-length",
+        type=float,
+        default=30.0,
+        help="能够用于保留杆塔的连续线路组件最小 XY 长度，单位为米。",
+    )
+    parser.add_argument(
+        "--min-contact-line-component-points",
+        type=int,
+        default=100,
+        help="能够用于保留杆塔的连续线路组件最少点数。",
+    )
     parser.add_argument(
         "--require-line-inside-tower",
         action="store_true",
@@ -468,10 +533,9 @@ def parse_args():
         "--require-insulator-line-bridge",
         action="store_true",
         help=(
-            "Keep only physical towers with enough nearby insulator points that "
-            "are also close to line points."
+            "可选的严格过滤：仅保留附近存在足够绝缘子点、且绝缘子靠近导线的杆塔。"
         ),
-    )# 要求杆塔附近的绝缘子必须和导线相邻，作为塔-线连接桥。
+    )# 默认不使用绝缘子约束；只有显式传入该参数时才启用。
     parser.add_argument(
         "--insulator-line-radius",
         type=float,
@@ -525,7 +589,7 @@ def parse_args():
     parser.add_argument(
         "--min-tower-height-above-ground",
         type=float,
-        default=0.0,
+        default=4.0,
         help=(
             "Remove tower components whose top is less than this many meters "
             "above nearby background/ground points. 0 disables this filter."
@@ -540,6 +604,7 @@ def parse_args():
     parser.add_argument(
         "--require-tower-top-line",
         action="store_true",
+        default=True,
         help=(
             "Keep only physical towers whose top area has enough nearby line "
             "points. This is useful for sparse pole-style segmentation where "
@@ -573,7 +638,7 @@ def parse_args():
     parser.add_argument(
         "--merge-tower-xy-radius",
         type=float,
-        default=12.0,
+        default=10.0,
         help=(
             "Merge kept tower components whose XY centers are within this radius, "
             "so one physical tower gets one box."
@@ -607,6 +672,29 @@ def parse_args():
         type=int,
         default=20,
         help="Minimum component point count eligible for tower-base recovery.",
+    )
+    parser.add_argument(
+        "--no-prune-nearby-tower-clutter",
+        action="store_true",
+        help="关闭真实杆塔附近脱离组件和塔底外围散点的精细清理。",
+    )
+    parser.add_argument(
+        "--tower-nearby-component-max-gap",
+        type=float,
+        default=3.0,
+        help="杆塔主体与同组次要组件允许的最大 XY 包围盒间距，单位为米。",
+    )
+    parser.add_argument(
+        "--tower-clutter-lower-height-ratio",
+        type=float,
+        default=0.35,
+        help="对杆塔底部此高度比例范围内的外围误分点执行清理。",
+    )
+    parser.add_argument(
+        "--tower-clutter-base-radius",
+        type=float,
+        default=6.0,
+        help="杆塔底部相对稳健中心保留的 XY 半径，单位为米。",
     )
     parser.add_argument(
         "--tower-box-margin",
@@ -659,19 +747,19 @@ def parse_args():
     parser.add_argument(
         "--line-corridor-width",
         type=float,
-        default=12.0,
+        default=20.0,
         help="Max XY distance from the tower-to-tower segment when selecting line points.",
     )
     parser.add_argument(
         "--span-end-margin",
         type=float,
-        default=5.0,
+        default=12.0,
         help="Extra meters before/after adjacent tower centers when selecting line spans.",
     )
     parser.add_argument(
         "--min-span-line-points",
         type=int,
-        default=50,
+        default=200,
         help="Skip a between-tower line box if fewer line points are selected.",
     )
     parser.add_argument(
@@ -700,7 +788,7 @@ def parse_args():
     parser.add_argument(
         "--edge-step",
         type=float,
-        default=0.25,
+        default=0.30,
         help="Spacing in meters for synthetic box-edge points.",
     )
     parser.add_argument(
@@ -777,9 +865,60 @@ def parse_args():
         help="Max side/z distance for coloring original line points by fitted conductor.",
     )
     parser.add_argument(
+        "--conductor-layer-z-gap",
+        type=float,
+        default=2.0,
+        help=(
+            "Vertical gap in meters used to group conductors into height layers "
+            "before numbering. Layers are numbered top-to-bottom; conductors in "
+            "the same layer are numbered by local side from small to large."
+        ),
+    )
+    parser.add_argument(
         "--no-append-conductor-fit",
         action="store_true",
         help="Color original line points only; do not append fitted conductor points.",
+    )
+    parser.add_argument(
+        "--no-append-conductor-labels",
+        action="store_true",
+        help="Do not append synthetic point labels showing conductor numbers.",
+    )
+    parser.add_argument(
+        "--conductor-label-size",
+        type=float,
+        default=1.6,
+        help="Height in meters of appended conductor number labels.",
+    )
+    parser.add_argument(
+        "--conductor-label-step",
+        type=float,
+        default=0.15,
+        help="Point spacing in meters for conductor number labels.",
+    )
+    parser.add_argument(
+        "--conductor-label-side-offset",
+        type=float,
+        default=0.0,
+        help="Side-direction offset in meters from the fitted conductor center.",
+    )
+    parser.add_argument(
+        "--conductor-label-z-offset",
+        type=float,
+        default=0.8,
+        help=(
+            "Vertical offset in meters from the fitted conductor center to the "
+            "center of the appended number label."
+        ),
+    )
+    parser.add_argument(
+        "--keep-existing-synthetic-points",
+        action="store_true",
+        help=(
+            "Keep existing synthetic points with classes 30/31 from the input. "
+            "By default they are removed before appending new conductor labels, "
+            "fitted conductor points, and box edges."
+        ),
     )
     parser.add_argument(
         "--no-recolor",
@@ -792,7 +931,32 @@ def parse_args():
         help="Only clean labels/recolor points; do not append box edge points.",
     )
     parser.add_argument("--overwrite", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    apply_legacy_preset(args)
+    return args
+
+
+def apply_legacy_preset(args):
+    """在显式请求时恢复较宽松的旧版默认参数。
+
+    当前项目默认使用集成后的输电线路工作流，正常生产使用只需要传入
+    input/output。legacy preset 仅用于复现实验或调试旧流程。
+    """
+    if args.preset != "legacy":
+        return
+    args.min_tower_points = 500
+    args.min_tower_height = 4.0
+    args.require_line_near_tower = False
+    args.tower_line_radius = 8.0
+    args.min_line_points_near_tower = 0
+    args.require_insulator_line_bridge = False
+    args.min_tower_height_above_ground = 0.0
+    args.require_tower_top_line = False
+    args.merge_tower_xy_radius = 12.0
+    args.line_corridor_width = 12.0
+    args.span_end_margin = 5.0
+    args.min_span_line_points = 50
+    args.edge_step = 0.25
 
 
 def coords_from_las(las):
@@ -802,6 +966,19 @@ def coords_from_las(las):
 def has_rgb(las):
     dims = set(las.point_format.dimension_names)
     return {"red", "green", "blue"}.issubset(dims)
+
+
+def remove_existing_synthetic_points(las, classes=(FITTED_CONDUCTOR_CLASS, BOX_CLASS)):
+    cls = np.asarray(las.classification, dtype=np.uint8)
+    keep = ~np.isin(cls, np.asarray(classes, dtype=np.uint8))
+    removed = int(cls.size - np.count_nonzero(keep))
+    if removed == 0:
+        return las, 0
+    kept = las.points.array[keep]
+    las.points = laspy.ScaleAwarePointRecord(
+        kept, las.header.point_format, las.header.scales, las.header.offsets
+    )
+    return las, removed
 
 
 def recolor_by_class(las, cls, args):
@@ -816,6 +993,102 @@ def recolor_by_class(las, cls, args):
         las.blue[mask] = color[2]
 
 
+def remove_low_line_insulator_points(las, coord, cls, args):
+    """把贴近地面的导线和绝缘子误分点改回背景类别。
+
+    点云不做物理删除，只修改 classification。这样既能清掉语义误检，
+    又不会破坏原始地面/植被点云密度。
+    """
+    if not args.remove_low_line_insulator:
+        return {
+            "removed_points": 0,
+            "removed_line_points": 0,
+            "removed_insulator_points": 0,
+            "ground_grid_count": 0,
+        }
+
+    candidate_mask = (cls == args.line_class) | (cls == args.insulator_class)
+    candidate_indices = np.flatnonzero(candidate_mask)
+    bg_indices = np.flatnonzero(cls == args.background_class)
+    if candidate_indices.size == 0 or bg_indices.size == 0:
+        return {
+            "removed_points": 0,
+            "removed_line_points": 0,
+            "removed_insulator_points": 0,
+            "ground_grid_count": 0,
+        }
+
+    grid_size = max(float(args.low_line_insulator_ground_grid_size), 1e-3)
+    ground_percentile = min(
+        max(float(args.low_line_insulator_ground_percentile), 0.0), 100.0
+    )
+    global_percentile = min(
+        max(float(args.low_line_insulator_global_ground_percentile), 0.0), 100.0
+    )
+    max_height = float(args.low_line_insulator_height)
+
+    bg_coord = coord[bg_indices]
+    origin_xy = bg_coord[:, :2].min(axis=0)
+    bg_grid = np.floor((bg_coord[:, :2] - origin_xy[None, :]) / grid_size).astype(
+        np.int64
+    )
+    bg_keys = bg_grid[:, 0] * 4294967291 + bg_grid[:, 1]
+    order = np.argsort(bg_keys)
+    sorted_keys = bg_keys[order]
+    sorted_z = bg_coord[order, 2]
+    unique_keys, start = np.unique(sorted_keys, return_index=True)
+    end = np.r_[start[1:], sorted_keys.size]
+    ground_z = np.empty(unique_keys.shape[0], dtype=np.float64)
+    for i, (lo, hi) in enumerate(zip(start, end)):
+        ground_z[i] = float(np.percentile(sorted_z[lo:hi], ground_percentile))
+
+    candidate_coord = coord[candidate_indices]
+    candidate_grid = np.floor(
+        (candidate_coord[:, :2] - origin_xy[None, :]) / grid_size
+    ).astype(np.int64)
+    candidate_keys = candidate_grid[:, 0] * 4294967291 + candidate_grid[:, 1]
+    pos = np.searchsorted(unique_keys, candidate_keys)
+    found = pos < unique_keys.size
+    if np.any(found):
+        found_indices = np.flatnonzero(found)
+        found[found_indices] = unique_keys[pos[found_indices]] == candidate_keys[
+            found_indices
+        ]
+
+    fallback_ground_z = float(np.percentile(bg_coord[:, 2], global_percentile))
+    local_ground_z = np.full(candidate_indices.size, fallback_ground_z, dtype=np.float64)
+    local_ground_z[found] = ground_z[pos[found]]
+
+    low_mask = candidate_coord[:, 2] <= local_ground_z + max_height
+    removed_indices = candidate_indices[low_mask]
+    if removed_indices.size == 0:
+        return {
+            "removed_points": 0,
+            "removed_line_points": 0,
+            "removed_insulator_points": 0,
+            "ground_grid_count": int(unique_keys.size),
+        }
+
+    removed_line_points = int(np.count_nonzero(cls[removed_indices] == args.line_class))
+    removed_insulator_points = int(
+        np.count_nonzero(cls[removed_indices] == args.insulator_class)
+    )
+    cls[removed_indices] = args.background_class
+    las.classification[removed_indices] = args.background_class
+    if has_rgb(las):
+        color = DEFAULT_CLASS_COLORS_16.get(args.background_class, (37008, 37008, 37008))
+        las.red[removed_indices] = color[0]
+        las.green[removed_indices] = color[1]
+        las.blue[removed_indices] = color[2]
+
+    return {
+        "removed_points": int(removed_indices.size),
+        "removed_line_points": removed_line_points,
+        "removed_insulator_points": removed_insulator_points,
+        "ground_grid_count": int(unique_keys.size),
+    }
+
+
 def neighbor_offsets(connectivity):
     offsets = []
     for dx in (-1, 0, 1):
@@ -828,7 +1101,7 @@ def neighbor_offsets(connectivity):
                     continue
                 if connectivity == "18" and manhattan > 2:
                     continue
-                # Use only half of the symmetric neighborhood.
+                # 对称邻域只取一半，避免重复建边。
                 if (dx, dy, dz) > (0, 0, 0):
                     offsets.append((dx, dy, dz))
     return offsets
@@ -1011,7 +1284,10 @@ def apply_tower_cleanup(las, cls, tower_indices, point_comp, components, backgro
     if tower_indices.size == 0:
         return np.empty(0, dtype=np.int64)
     keep_by_comp = np.asarray([comp["keep"] for comp in components], dtype=bool)
-    keep_point = keep_by_comp[point_comp]
+    # 点级精修会把杆塔组件内部的外围误分点标记为 -1；这些点也要改回背景。
+    keep_point = np.zeros(point_comp.shape[0], dtype=bool)
+    valid_component = point_comp >= 0
+    keep_point[valid_component] = keep_by_comp[point_comp[valid_component]]
     remove_indices = tower_indices[~keep_point]
     cls[remove_indices] = background_class
     las.classification[remove_indices] = background_class
@@ -1113,6 +1389,118 @@ def recover_tower_base_components(components, seed_towers, args):
             recovered += 1
             break
     return recovered
+
+
+def xy_bbox_gap(left, right):
+    """计算两个轴对齐 XY 包围盒之间的最短距离。"""
+    delta = np.maximum(
+        np.maximum(
+            left["bbox_min"][:2] - right["bbox_max"][:2],
+            right["bbox_min"][:2] - left["bbox_max"][:2],
+        ),
+        0.0,
+    )
+    return float(np.linalg.norm(delta))
+
+
+def prune_detached_tower_components(components, towers, args):
+    """删除因中心距离较近而并入真实杆塔、但与主体脱离的误检组件。"""
+    if args.no_prune_nearby_tower_clutter:
+        return 0
+
+    max_gap = max(float(args.tower_nearby_component_max_gap), 0.0)
+    component_by_id = {int(comp["id"]): comp for comp in components}
+    removed = 0
+    for tower in towers:
+        group = [
+            component_by_id[int(component_id)]
+            for component_id in tower["component_ids"]
+            if int(component_id) in component_by_id
+            and component_by_id[int(component_id)]["keep"]
+        ]
+        if len(group) <= 1:
+            continue
+
+        # 杆塔主体通常是高度最高、点数最多的组件。
+        anchor = max(
+            group,
+            key=lambda comp: (float(comp["size"][2]), int(comp["point_count"])),
+        )
+        for comp in group:
+            if comp is anchor or xy_bbox_gap(anchor, comp) <= max_gap:
+                continue
+            comp["keep"] = False
+            comp["remove_reason"] = "detached_nearby_tower_clutter"
+            removed += 1
+    return removed
+
+
+def prune_low_tower_clutter_points(towers, coord, tower_indices, point_comp, args):
+    """清除物理杆塔下部远离主体中心的散乱杆塔误分点。"""
+    if args.no_prune_nearby_tower_clutter:
+        return np.empty((0,), dtype=np.int64)
+
+    ratio = float(np.clip(args.tower_clutter_lower_height_ratio, 0.0, 0.95))
+    radius = float(args.tower_clutter_base_radius)
+    if ratio <= 0 or radius <= 0 or tower_indices.size == 0:
+        return np.empty((0,), dtype=np.int64)
+
+    removed_local_parts = []
+    for tower in towers:
+        component_ids = np.asarray(tower["component_ids"], dtype=np.int64)
+        local_positions = np.flatnonzero(np.isin(point_comp, component_ids))
+        if local_positions.size == 0:
+            continue
+
+        points = coord[tower_indices[local_positions]]
+        z_min = float(points[:, 2].min())
+        z_max = float(points[:, 2].max())
+        height = z_max - z_min
+        if height <= 1e-6:
+            continue
+
+        # 用杆塔中部点的 XY 中位数估计主体中心，避免塔底误分散点拉偏中心。
+        center_mask = (
+            (points[:, 2] >= z_min + height * 0.35)
+            & (points[:, 2] <= z_min + height * 0.75)
+        )
+        center_points = points[center_mask]
+        if center_points.shape[0] < 10:
+            center_points = points[points[:, 2] >= z_min + height * 0.35]
+        center_xy = np.median(center_points[:, :2], axis=0)
+
+        lower_mask = points[:, 2] <= z_min + height * ratio
+        radial_distance = np.linalg.norm(points[:, :2] - center_xy[None, :], axis=1)
+        remove_mask = lower_mask & (radial_distance > radius)
+        if np.any(remove_mask):
+            removed_local_parts.append(local_positions[remove_mask])
+
+    if not removed_local_parts:
+        return np.empty((0,), dtype=np.int64)
+
+    removed_local = np.unique(np.concatenate(removed_local_parts))
+    removed_global = tower_indices[removed_local]
+    point_comp[removed_local] = -1
+    return removed_global
+
+
+def refresh_tower_geometry(towers, coord, tower_indices, point_comp):
+    """根据组件和点级精修后的有效点重新计算物理杆塔几何信息。"""
+    refreshed = []
+    for tower in towers:
+        points = points_for_tower(
+            coord, tower_indices, point_comp, tower["component_ids"]
+        )
+        if points.size == 0:
+            continue
+        item = dict(tower)
+        item["point_count"] = int(points.shape[0])
+        item["bbox_min"] = points.min(axis=0)
+        item["bbox_max"] = points.max(axis=0)
+        item["size"] = item["bbox_max"] - item["bbox_min"]
+        item["center"] = (item["bbox_min"] + item["bbox_max"]) / 2.0
+        refreshed.append(item)
+    return refreshed
 
 
 def box_bounds(points, margin):
@@ -1258,8 +1646,8 @@ def make_oriented_tower_box(points, margin):
         long_xy = np.array([1.0, 0.0], dtype=np.float64)
     else:
         long_xy = long_xy / norm
-    # PCA eigenvectors have arbitrary sign. Prefer the north-facing equivalent so
-    # tower quaternions do not flip by 180 degrees between similar detections.
+    # 主成分分析特征向量的正负号不固定。这里优先选择朝北等价方向，
+    # 避免相近杆塔检测结果的四元数出现 180 度翻转。
     if long_xy[0] < 0 or (abs(long_xy[0]) < 1e-9 and long_xy[1] < 0):
         long_xy = -long_xy
     axes = local_axes_from_direction(long_xy)
@@ -1392,6 +1780,37 @@ def tower_line_contact_radius(args):
     return max(float(radius), 0.0)
 
 
+def select_continuous_line_points(line_coord, args):
+    """只保留属于足够长三维连通组件的导线点，排除杆塔附近短碎线。"""
+    if line_coord.shape[0] == 0:
+        return line_coord, {"component_count": 0, "kept_component_count": 0}
+
+    voxel_size = max(float(args.line_contact_voxel_size), 1e-3)
+    origin = line_coord.min(axis=0)
+    grid = np.floor((line_coord - origin) / voxel_size).astype(np.int64)
+    voxels, inverse = np.unique(grid, axis=0, return_inverse=True)
+    voxel_comp = connected_components_from_voxels(voxels, "26")
+    point_comp = voxel_comp[inverse]
+    component_count = int(point_comp.max()) + 1 if point_comp.size else 0
+
+    counts = np.bincount(point_comp, minlength=component_count)
+    bbox_min = np.full((component_count, 3), np.inf, dtype=np.float64)
+    bbox_max = np.full((component_count, 3), -np.inf, dtype=np.float64)
+    np.minimum.at(bbox_min, point_comp, line_coord)
+    np.maximum.at(bbox_max, point_comp, line_coord)
+    xy_length = np.linalg.norm(bbox_max[:, :2] - bbox_min[:, :2], axis=1)
+    keep_component = (
+        (counts >= int(args.min_contact_line_component_points))
+        & (xy_length >= float(args.min_contact_line_component_length))
+    )
+    keep_point = keep_component[point_comp]
+    return line_coord[keep_point], {
+        "component_count": int(component_count),
+        "kept_component_count": int(np.count_nonzero(keep_component)),
+        "kept_point_count": int(np.count_nonzero(keep_point)),
+    }
+
+
 def count_line_points_touch_tower(line_tree, tower_points, tower_box, args):
     empty = {"count": 0, "min_distance": None, "radius": tower_line_contact_radius(args)}
     if line_tree is None or tower_points.shape[0] == 0 or tower_box is None:
@@ -1424,7 +1843,17 @@ def filter_towers_by_line_touch_box(
         return towers, tower_box_list, 0
 
     line_coord = coord[cls == args.line_class]
-    line_tree = cKDTree(line_coord) if line_coord.shape[0] else None
+    contact_line_coord, contact_stats = select_continuous_line_points(line_coord, args)
+    line_tree = cKDTree(contact_line_coord) if contact_line_coord.shape[0] else None
+    print(
+        "Continuous line contact: components={} kept={} points={}/{}".format(
+            contact_stats["component_count"],
+            contact_stats["kept_component_count"],
+            contact_stats.get("kept_point_count", 0),
+            line_coord.shape[0],
+        ),
+        flush=True,
+    )
     box_by_id = {int(box["tower_id"]): box for box in tower_box_list}
     kept_towers = []
     removed_component_ids = set()
@@ -2291,6 +2720,31 @@ def fit_track(track, args):
     }
 
 
+def sort_conductor_fits_by_height_layer(fits, args):
+    if not fits:
+        return []
+    layer_gap = max(float(args.conductor_layer_z_gap), 0.0)
+    high_to_low = sorted(fits, key=lambda fit: fit["sort_z"], reverse=True)
+    layers = []
+    current = []
+    previous_z = None
+    for fit in high_to_low:
+        if previous_z is not None and previous_z - fit["sort_z"] > layer_gap:
+            layers.append(current)
+            current = []
+        current.append(fit)
+        previous_z = fit["sort_z"]
+    if current:
+        layers.append(current)
+
+    ordered = []
+    for layer_no, layer in enumerate(layers, start=1):
+        for fit in sorted(layer, key=lambda item: item["sort_side"]):
+            fit["sort_layer"] = int(layer_no)
+            ordered.append(fit)
+    return ordered
+
+
 def evaluate_fit(fit, along):
     side = np.polyval(fit["side_coef"], along)
     z = np.polyval(fit["z_coef"], along)
@@ -2307,6 +2761,84 @@ def sample_fit_world(fit, axes, origin, step, along_min=None, along_max=None):
     sample_side, sample_z = evaluate_fit(fit, sample_along)
     sample_local = np.column_stack((sample_along, sample_side, sample_z))
     return line_local_to_world(sample_local, axes, origin)
+
+
+SEVEN_SEGMENT_DIGITS = {
+    "0": ("a", "b", "c", "d", "e", "f"),
+    "1": ("b", "c"),
+    "2": ("a", "b", "g", "e", "d"),
+    "3": ("a", "b", "g", "c", "d"),
+    "4": ("f", "g", "b", "c"),
+    "5": ("a", "f", "g", "c", "d"),
+    "6": ("a", "f", "g", "e", "c", "d"),
+    "7": ("a", "b", "c"),
+    "8": ("a", "b", "c", "d", "e", "f", "g"),
+    "9": ("a", "b", "c", "d", "f", "g"),
+}
+
+SEVEN_SEGMENT_ENDPOINTS = {
+    "a": ((0.0, 1.0), (1.0, 1.0)),
+    "b": ((1.0, 1.0), (1.0, 0.5)),
+    "c": ((1.0, 0.5), (1.0, 0.0)),
+    "d": ((0.0, 0.0), (1.0, 0.0)),
+    "e": ((0.0, 0.5), (0.0, 0.0)),
+    "f": ((0.0, 1.0), (0.0, 0.5)),
+    "g": ((0.0, 0.5), (1.0, 0.5)),
+}
+
+
+def sample_segment_2d(start, end, step):
+    start = np.asarray(start, dtype=np.float64)
+    end = np.asarray(end, dtype=np.float64)
+    length = float(np.linalg.norm(end - start))
+    count = max(int(np.ceil(length / max(step, 1e-3))) + 1, 2)
+    alpha = np.linspace(0.0, 1.0, count, dtype=np.float64)
+    return start[None, :] * (1.0 - alpha[:, None]) + end[None, :] * alpha[:, None]
+
+
+def conductor_number_label_world(conductor_no, fit, axes, origin, args):
+    text = str(int(conductor_no))
+    size = max(float(args.conductor_label_size), 0.1)
+    width = size * 0.6
+    gap = width * 0.35
+    step = max(float(args.conductor_label_step), 0.02)
+
+    along_mid = (float(fit["along_min"]) + float(fit["along_max"])) / 2.0
+    side_mid, z_mid = evaluate_fit(fit, np.asarray([along_mid], dtype=np.float64))
+    center_side = float(side_mid[0]) + float(args.conductor_label_side_offset)
+    center_z = float(z_mid[0]) + float(args.conductor_label_z_offset)
+
+    digit_points = []
+    total_width = len(text) * width + max(len(text) - 1, 0) * gap
+    side_start = center_side - total_width / 2.0
+    for digit_index, char in enumerate(text):
+        segments = SEVEN_SEGMENT_DIGITS.get(char)
+        if not segments:
+            continue
+        x0 = side_start + digit_index * (width + gap)
+        for segment in segments:
+            start, end = SEVEN_SEGMENT_ENDPOINTS[segment]
+            start = (
+                x0 + start[0] * width,
+                center_z + (start[1] - 0.5) * size,
+            )
+            end = (
+                x0 + end[0] * width,
+                center_z + (end[1] - 0.5) * size,
+            )
+            digit_points.append(sample_segment_2d(start, end, step))
+
+    if not digit_points:
+        return np.empty((0, 3), dtype=np.float64)
+    side_z = np.vstack(digit_points)
+    local = np.column_stack(
+        (
+            np.full(side_z.shape[0], along_mid, dtype=np.float64),
+            side_z[:, 0],
+            side_z[:, 1],
+        )
+    )
+    return line_local_to_world(local, axes, origin)
 
 
 def append_colored_points(las, points, colors, point_class):
@@ -2331,11 +2863,20 @@ def append_colored_points(las, points, colors, point_class):
 
 def fit_conductors_for_spans(las, coord, span_boxes, args):
     if args.no_fit_conductors:
-        return [], np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.uint16), 0
+        return (
+            [],
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.uint16),
+            np.empty((0, 3), dtype=np.float64),
+            np.empty((0, 3), dtype=np.uint16),
+            0,
+        )
 
     conductor_reports = []
     fitted_points = []
     fitted_colors = []
+    label_points = []
+    label_colors = []
     colored_original = 0
     global_fit_no = 1
 
@@ -2376,10 +2917,13 @@ def fit_conductors_for_spans(las, coord, span_boxes, args):
             mid = (fit["along_min"] + fit["along_max"]) / 2.0
             fit["sort_side"] = float(np.polyval(fit["side_coef"], mid))
             fit["sort_z"] = float(np.polyval(fit["z_coef"], mid))
-        fits = sorted(
-            fits,
-            key=lambda fit: (fit["sort_side"], -fit["sort_z"]),
-        )
+            sort_local = np.asarray(
+                [[mid, fit["sort_side"], fit["sort_z"]]], dtype=np.float64
+            )
+            sort_world = line_local_to_world(sort_local, axes, origin)[0]
+            fit["sort_x"] = float(sort_world[0])
+            fit["sort_y"] = float(sort_world[1])
+        fits = sort_conductor_fits_by_height_layer(fits, args)
 
         assigned = np.full(selected.shape[0], -1, dtype=np.int64)
         best_dist = np.full(selected.shape[0], np.inf, dtype=np.float64)
@@ -2398,7 +2942,8 @@ def fit_conductors_for_spans(las, coord, span_boxes, args):
 
         for local_fit_id, fit in enumerate(fits):
             conductor_no = local_fit_id + 1
-            color = CONDUCTOR_COLORS_16[(conductor_no - 1) % len(CONDUCTOR_COLORS_16)]
+            layer_no = int(fit.get("sort_layer", conductor_no))
+            color = CONDUCTOR_COLORS_16[(layer_no - 1) % len(CONDUCTOR_COLORS_16)]
             assigned_mask = (assigned == local_fit_id) & (
                 best_dist <= args.conductor_assign_radius
             )
@@ -2422,6 +2967,13 @@ def fit_conductors_for_spans(las, coord, span_boxes, args):
             if not args.no_append_conductor_fit:
                 fitted_points.append(sample_world)
                 fitted_colors.append(np.tile(color[None, :], (sample_world.shape[0], 1)))
+            if not args.no_append_conductor_labels:
+                label_world = conductor_number_label_world(conductor_no, fit, axes, origin, args)
+                if label_world.size:
+                    label_points.append(label_world)
+                    label_colors.append(
+                        np.tile(color[None, :], (label_world.shape[0], 1))
+                    )
 
             conductor_reports.append(
                 {
@@ -2437,6 +2989,7 @@ def fit_conductors_for_spans(las, coord, span_boxes, args):
                     "colored_original_line_points": original_count,
                     "fitted_point_count": int(sample_world.shape[0]),
                     "color_rgb_16": color.astype(int).tolist(),
+                    "color_by": "sort_layer",
                     "along_min": float(fit["along_min"]),
                     "along_max": float(fit["along_max"]),
                     "json_along_min": (
@@ -2451,6 +3004,9 @@ def fit_conductors_for_spans(las, coord, span_boxes, args):
                     ),
                     "span_start_m": float(span.get("span_start_m", fit["along_min"])),
                     "span_end_m": float(span.get("span_end_m", fit["along_max"])),
+                    "sort_x": float(fit["sort_x"]),
+                    "sort_y": float(fit["sort_y"]),
+                    "sort_layer": int(fit.get("sort_layer", 0)),
                     "sort_side": float(fit["sort_side"]),
                     "sort_z": float(fit["sort_z"]),
                     "side_poly_coef": fit["side_coef"].tolist(),
@@ -2460,17 +3016,32 @@ def fit_conductors_for_spans(las, coord, span_boxes, args):
             )
             global_fit_no += 1
 
-    if fitted_points:
-        return (
-            conductor_reports,
-            np.vstack(fitted_points),
-            np.vstack(fitted_colors).astype(np.uint16, copy=False),
-            colored_original,
-        )
+    conductor_points = (
+        np.vstack(fitted_points)
+        if fitted_points
+        else np.empty((0, 3), dtype=np.float64)
+    )
+    conductor_colors = (
+        np.vstack(fitted_colors).astype(np.uint16, copy=False)
+        if fitted_colors
+        else np.empty((0, 3), dtype=np.uint16)
+    )
+    number_label_points = (
+        np.vstack(label_points)
+        if label_points
+        else np.empty((0, 3), dtype=np.float64)
+    )
+    number_label_colors = (
+        np.vstack(label_colors).astype(np.uint16, copy=False)
+        if label_colors
+        else np.empty((0, 3), dtype=np.uint16)
+    )
     return (
         conductor_reports,
-        np.empty((0, 3), dtype=np.float64),
-        np.empty((0, 3), dtype=np.uint16),
+        conductor_points,
+        conductor_colors,
+        number_label_points,
+        number_label_colors,
         colored_original,
     )
 
@@ -2727,11 +3298,11 @@ def rotation_matrix_to_quaternion(matrix):
 
 
 def north_relative_rotation_from_axes(axes):
-    """Return rotation from a north-facing OBB basis to fitted axes.
+    """返回从正北朝向 OBB 基到拟合坐标轴的旋转。
 
-    The fitted box stores axes as row vectors: local length, local width, local Z.
-    A north-facing box is defined as length=LAS X+, width=LAS Y+, Z=up, so that
-    boxes already facing north export identity rotation.
+    拟合框的 axes 以行向量保存：局部长轴、局部宽轴、局部 Z。
+    正北框定义为 length=LAS X+、width=LAS Y+、Z=向上，
+    因此已经朝北的框会导出单位旋转。
     """
     fitted_rotation = np.asarray(axes, dtype=np.float64).T
     north_axes = local_axes_from_direction(np.array([1.0, 0.0], dtype=np.float64))
@@ -2757,8 +3328,8 @@ def box_to_obb_record(box, class_name, instance_name, origin, orientation="fitte
         extent = (box["half_size"] * 2.0).astype(np.float64, copy=False)
         axes = box["axes"]
         if box.get("kind") == "line_span":
-            # For span JSON, the tower-to-tower direction is the box width axis.
-            # Use -side, along, up to keep a right-handed local coordinate frame.
+            # 对档距 JSON，塔到塔方向作为框的 width 轴。
+            # 使用 -side、along、up 组成右手局部坐标系。
             axes = np.vstack([-axes[1], axes[0], axes[2]])
             extent = extent[[1, 0, 2]]
             extent_order = [
@@ -2818,67 +3389,29 @@ def resolve_obb_origin(las, args):
     return (header_mins + header_maxs) / 2.0
 
 
-def main():
-    args = parse_args()
-    global laspy
-    import laspy as laspy_module
+def build_tower_state(coord, cls, args):
+    """构建清理后的杆塔组件和物理杆塔实例。
 
-    laspy = laspy_module
-    input_path = Path(args.input)
-    output_path = Path(args.output)
-    report_path = (
-        Path(args.report)
-        if args.report
-        else output_path.with_name(output_path.stem + "_tower_line_report.json")
-    )
-    default_tower_box_report, default_line_box_report = default_standard_json_paths(
-        report_path
-    )
-    tower_box_report_path = (
-        Path(args.tower_box_report) if args.tower_box_report else None
-    )
-    combined_box_report_path = (
-        Path(args.combined_box_report)
-        if args.combined_box_report
-        else Path(args.line_box_report)
-        if args.line_box_report
-        else default_line_box_report
-    )
-    conductor_report_path = (
-        Path(args.conductor_report)
-        if args.conductor_report
-        else report_path.with_name(
-            report_path.stem[: -len("_report")] + "_conductors.json"
-            if report_path.stem.endswith("_report")
-            else report_path.stem + "_conductors.json"
-        )
-    )
-    if output_path.exists() and not args.overwrite:
-        raise FileExistsError(f"Output exists, use --overwrite: {output_path}")
-
+    这是两个阶段共用的后处理核心：
+    1. 清理 class=1 的杆塔误检；
+    2. 生成后续画框所需的有效物理杆塔。
+    """
     start = time.perf_counter()
-    print(f"Reading {input_path}", flush=True)
-    las = laspy.read(input_path)
-    if "classification" not in set(las.point_format.dimension_names):
-        raise ValueError("Input LAS has no classification dimension.")
 
-    coord = coords_from_las(las)
-    obb_origin = resolve_obb_origin(las, args)
-    cls = np.asarray(las.classification, dtype=np.uint8).copy()
-    original_counts = {
-        str(i): int(v) for i, v in enumerate(np.bincount(cls, minlength=32)) if v
-    }
-    print(f"Loaded {coord.shape[0]} points; class counts: {original_counts}", flush=True)
-
-    recolor_by_class(las, cls, args)
-
-    t0 = time.perf_counter()
+    # 将预测为杆塔的点聚类成连通组件。
     components, tower_indices, point_comp = cluster_towers(coord, cls, args)
+
+    # 执行组件级过滤：点数、高度、XY 尺寸、附近导线、局部地面高度等。
     mark_components_to_keep(components, coord, cls, args)
+
+    # 恢复保留杆塔脚印附近的小型低矮组件，避免严格过滤误删杆塔底部。
     seed_towers = merge_physical_towers(components, args)
     recovered_base_components = recover_tower_base_components(
         components, seed_towers, args
     )
+
+    # 将组件合并成物理杆塔实例。默认使用导线和顶部导线关系验证；
+    # 绝缘子关系只有显式传入对应参数时才参与过滤。
     physical_towers = merge_physical_towers(components, args)
     physical_towers = assign_tower_names(physical_towers, args)
     initial_tower_boxes = tower_boxes(
@@ -2954,38 +3487,262 @@ def main():
         )
     )
     physical_towers = assign_tower_names(physical_towers, args)
+
+    # 关系过滤之后，再清理被合并到真实杆塔附近的背景误分点。
+    # 第一层删除与杆塔主体脱离的次要组件，第二层清理塔底外围散点。
+    removed_detached_tower_components = prune_detached_tower_components(
+        components, physical_towers, args
+    )
+    if removed_detached_tower_components:
+        physical_towers = merge_physical_towers(components, args)
+        physical_towers = assign_tower_names(physical_towers, args)
+    removed_low_tower_clutter_indices = prune_low_tower_clutter_points(
+        physical_towers, coord, tower_indices, point_comp, args
+    )
+    physical_towers = refresh_tower_geometry(
+        physical_towers, coord, tower_indices, point_comp
+    )
+    physical_towers = assign_tower_names(physical_towers, args)
+    initial_tower_boxes = tower_boxes(
+        physical_towers, coord, tower_indices, point_comp, args.tower_box_margin
+    )
+
+    return {
+        "components": components,
+        "tower_indices": tower_indices,
+        "point_comp": point_comp,
+        "physical_towers": physical_towers,
+        "initial_tower_boxes": initial_tower_boxes,
+        "recovered_base_components": int(recovered_base_components),
+        "removed_physical_towers_without_through_line": int(removed_physical_towers),
+        "removed_physical_towers_without_line_touch": int(removed_no_touch_towers),
+        "removed_physical_towers_without_top_line": int(removed_no_top_line_towers),
+        "removed_physical_towers_with_too_few_inside_line_points": int(
+            removed_inside_line_towers
+        ),
+        "removed_physical_towers_without_continuous_inside_line": int(
+            removed_noncontinuous_line_towers
+        ),
+        "removed_physical_towers_without_side_line": int(removed_no_side_line_towers),
+        "removed_physical_towers_without_nearby_insulator": int(
+            removed_insulatorless_towers
+        ),
+        "removed_physical_towers_without_insulator_line_bridge": int(
+            removed_unbridged_insulator_towers
+        ),
+        "removed_bare_pole_physical_towers": int(removed_bare_pole_towers),
+        "removed_physical_towers_without_connected_line_span": int(
+            removed_unconnected_span_towers
+        ),
+        "removed_detached_tower_components": int(
+            removed_detached_tower_components
+        ),
+        "removed_low_tower_clutter_points": int(
+            removed_low_tower_clutter_indices.size
+        ),
+        "elapsed_sec": float(time.perf_counter() - start),
+    }
+
+
+
+def main():
+    args = parse_args()
+    global laspy
+    import laspy as laspy_module
+
+    laspy = laspy_module
+    if args.preset == "legacy":
+        apply_legacy_preset(args)
+
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+    report_path = (
+        Path(args.report)
+        if args.report
+        else output_path.with_name(output_path.stem + "_clean_report.json")
+    )
+    if output_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Output exists, use --overwrite: {output_path}")
+    if report_path.exists() and not args.overwrite:
+        raise FileExistsError(f"Report exists, use --overwrite: {report_path}")
+
+    start = time.perf_counter()
+    print(f"Reading {input_path}", flush=True)
+    las = laspy.read(input_path)
+    if "classification" not in set(las.point_format.dimension_names):
+        raise ValueError("Input LAS has no classification dimension.")
+
+    # 清理脚本只处理原始四分类点。若输入里已经有画框脚本追加的 class 30/31，
+    # 默认先删除，避免旧框、旧拟合线影响后续统计和可视化。
+    removed_existing_synthetic_points = 0
+    if not args.keep_existing_synthetic_points:
+        las, removed_existing_synthetic_points = remove_existing_synthetic_points(las)
+        if removed_existing_synthetic_points:
+            print(
+                f"Removed {removed_existing_synthetic_points} existing synthetic points "
+                f"(classes {FITTED_CONDUCTOR_CLASS}/{BOX_CLASS})",
+                flush=True,
+            )
+
+    coord = coords_from_las(las)
+    cls = np.asarray(las.classification, dtype=np.uint8).copy()
+    original_counts = {
+        str(i): int(v) for i, v in enumerate(np.bincount(cls, minlength=32)) if v
+    }
+    print(f"Loaded {coord.shape[0]} points; class counts: {original_counts}", flush=True)
+
+    # 给原始四分类重新着色，方便在 CloudCompare 中直接查看清理结果。
+    recolor_by_class(las, cls, args)
+
+    t0 = time.perf_counter()
+
+    # 1）先清理贴近地面的导线/绝缘子误分点。真实导线和绝缘子通常在杆塔上部，
+    # 贴地的 class=2/3 大多会干扰后续杆塔-线路关系判断，所以先改回背景。
+    low_line_insulator_stats = remove_low_line_insulator_points(las, coord, cls, args)
+    if low_line_insulator_stats["removed_points"]:
+        print(
+            "Removed low line/insulator points: total={} line={} insulator={} "
+            "ground_grids={}".format(
+                low_line_insulator_stats["removed_points"],
+                low_line_insulator_stats["removed_line_points"],
+                low_line_insulator_stats["removed_insulator_points"],
+                low_line_insulator_stats["ground_grid_count"],
+            ),
+            flush=True,
+        )
+
+    # 2）把预测为杆塔的点聚类成组件。模型可能把背景、植被、细杆误分成杆塔，
+    # 所以后续所有判断都以组件为单位，而不是单点判断。
+    components, tower_indices, point_comp = cluster_towers(coord, cls, args)
+
+    # 3）基础组件过滤：点数、高度、XY 尺寸、离地高度、附近导线点等。
+    mark_components_to_keep(components, coord, cls, args)
+
+    # 4）先根据保留组件合并物理杆塔，再恢复塔脚附近低矮碎片，避免塔底被误删。
+    seed_towers = merge_physical_towers(components, args)
+    recovered_base_components = recover_tower_base_components(
+        components, seed_towers, args
+    )
+    physical_towers = merge_physical_towers(components, args)
+    physical_towers = assign_tower_names(physical_towers, args)
+    initial_tower_boxes = tower_boxes(
+        physical_towers, coord, tower_indices, point_comp, args.tower_box_margin
+    )
+
+    # 5）关系过滤：默认根据杆塔和导线之间的空间关系删除假杆塔；
+    # 绝缘子关系只有显式传入对应参数时才参与过滤。
+    physical_towers, initial_tower_boxes, removed_physical_towers = (
+        filter_towers_by_line_through_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_no_touch_towers = (
+        filter_towers_by_line_touch_box(
+            components,
+            physical_towers,
+            initial_tower_boxes,
+            coord,
+            cls,
+            tower_indices,
+            point_comp,
+            args,
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_no_top_line_towers = (
+        filter_towers_by_top_line(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_inside_line_towers = (
+        filter_towers_by_line_inside_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_noncontinuous_line_towers = (
+        filter_towers_by_continuous_line_inside_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_no_side_line_towers = (
+        filter_towers_by_side_line_box(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_insulatorless_towers = (
+        filter_towers_by_insulator(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_unbridged_insulator_towers = (
+        filter_towers_by_insulator_line_bridge(
+            components, physical_towers, initial_tower_boxes, coord, cls, args
+        )
+    )
+    physical_towers, initial_tower_boxes, removed_bare_pole_towers = (
+        filter_bare_pole_towers(
+            components,
+            physical_towers,
+            initial_tower_boxes,
+            coord,
+            tower_indices,
+            point_comp,
+            args,
+        )
+    )
+    physical_towers = assign_tower_names(physical_towers, args)
+    physical_towers, initial_tower_boxes, removed_unconnected_span_towers, _ = (
+        filter_towers_by_connected_line_span(
+            components,
+            physical_towers,
+            initial_tower_boxes,
+            coord,
+            cls,
+            args,
+        )
+    )
+    physical_towers = assign_tower_names(physical_towers, args)
+
+    # 6）清理真实杆塔附近的背景误分：先删除脱离主体的次要组件，
+    # 再删除杆塔下部、远离主体中心的散乱点。
+    removed_detached_tower_components = prune_detached_tower_components(
+        components, physical_towers, args
+    )
+    if removed_detached_tower_components:
+        physical_towers = merge_physical_towers(components, args)
+        physical_towers = assign_tower_names(physical_towers, args)
+    removed_low_tower_clutter_indices = prune_low_tower_clutter_points(
+        physical_towers, coord, tower_indices, point_comp, args
+    )
+    physical_towers = refresh_tower_geometry(
+        physical_towers, coord, tower_indices, point_comp
+    )
+    physical_towers = assign_tower_names(physical_towers, args)
+
+    # 7）把过滤结果写回 LAS：误检杆塔点不删除，只把 classification 从 tower 改成 background。
     removed_indices = apply_tower_cleanup(
         las, cls, tower_indices, point_comp, components, args.background_class
     )
+    final_original_counts = {
+        str(i): int(v) for i, v in enumerate(np.bincount(cls, minlength=32)) if v
+    }
+    cleanup_elapsed = time.perf_counter() - t0
     print(
         "Tower cleanup: components={} kept={} removed_points={} in {:.2f}s".format(
             len(components),
             sum(1 for item in components if item["keep"]),
             removed_indices.size,
-            time.perf_counter() - t0,
+            cleanup_elapsed,
         ),
         flush=True,
     )
     if recovered_base_components:
-        print(
-            f"Recovered {recovered_base_components} low tower-base components",
-            flush=True,
-        )
+        print(f"Recovered {recovered_base_components} low tower-base components", flush=True)
     if removed_physical_towers:
-        print(
-            f"Removed {removed_physical_towers} physical towers without through-line",
-            flush=True,
-        )
+        print(f"Removed {removed_physical_towers} physical towers without through-line", flush=True)
     if removed_no_touch_towers:
-        print(
-            f"Removed {removed_no_touch_towers} physical towers without line touch",
-            flush=True,
-        )
+        print(f"Removed {removed_no_touch_towers} physical towers without line touch", flush=True)
     if removed_no_top_line_towers:
-        print(
-            f"Removed {removed_no_top_line_towers} physical towers without top line",
-            flush=True,
-        )
+        print(f"Removed {removed_no_top_line_towers} physical towers without top line", flush=True)
     if removed_inside_line_towers:
         print(
             f"Removed {removed_inside_line_towers} physical towers with too few inside line points",
@@ -2997,10 +3754,7 @@ def main():
             flush=True,
         )
     if removed_no_side_line_towers:
-        print(
-            f"Removed {removed_no_side_line_towers} physical towers without side line",
-            flush=True,
-        )
+        print(f"Removed {removed_no_side_line_towers} physical towers without side line", flush=True)
     if removed_insulatorless_towers:
         print(
             f"Removed {removed_insulatorless_towers} physical towers without nearby insulator",
@@ -3012,70 +3766,37 @@ def main():
             flush=True,
         )
     if removed_bare_pole_towers:
-        print(
-            f"Removed {removed_bare_pole_towers} bare-pole physical towers",
-            flush=True,
-        )
+        print(f"Removed {removed_bare_pole_towers} bare-pole physical towers", flush=True)
     if removed_unconnected_span_towers:
         print(
             f"Removed {removed_unconnected_span_towers} physical towers without connected line span",
             flush=True,
         )
-
-    kept_components = [comp for comp in components if comp["keep"]]
-    boxes = tower_boxes(
-        physical_towers, coord, tower_indices, point_comp, args.tower_box_margin
-    )
-    tower_box_by_id = {int(box["tower_id"]): box for box in boxes if box["kind"] == "tower"}
-    span_boxes = line_span_boxes(coord, cls, physical_towers, tower_box_by_id, args)
-    boxes.extend(span_boxes)
-    print(
-        "Boxes: kept_components={}, physical_towers={}, line_span={}".format(
-            len(kept_components), len(physical_towers), len(span_boxes)
-        ),
-        flush=True,
-    )
-
-    conductor_reports, conductor_points, conductor_colors, colored_line_points = (
-        fit_conductors_for_spans(las, coord, span_boxes, args)
-    )
-    appended_conductor_points = 0
-    if conductor_points.size:
-        las, appended_conductor_points = append_colored_points(
-            las, conductor_points, conductor_colors, FITTED_CONDUCTOR_CLASS
-        )
-    if conductor_reports:
+    if removed_detached_tower_components:
         print(
-            "Conductors: fitted={} colored_original_points={} appended_points={}".format(
-                len(conductor_reports),
-                colored_line_points,
-                appended_conductor_points,
-            ),
+            f"Removed {removed_detached_tower_components} detached components near real towers",
+            flush=True,
+        )
+    if removed_low_tower_clutter_indices.size:
+        print(
+            f"Removed {removed_low_tower_clutter_indices.size} low scattered tower points",
             flush=True,
         )
 
-    appended_points = 0
-    if not args.no_append_box_points:
-        las, appended_points = append_boxes(las, boxes, args.edge_step)
-        print(f"Appended {appended_points} box-edge points", flush=True)
+    # 清理后再次按类别着色。这个 LAS 可以直接作为画框脚本的输入。
+    recolor_by_class(las, cls, args)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     las.write(output_path)
     elapsed = time.perf_counter() - start
 
-    final_counts = {
-        str(i): int(v) for i, v in enumerate(np.bincount(cls, minlength=32)) if v
-    }
-    debug_conductor_reports = []
-    for conductor in conductor_reports:
-        item = dict(conductor)
-        item.pop("polyline_xyz", None)
-        debug_conductor_reports.append(item)
+    kept_components = [comp for comp in components if comp["keep"]]
     report = {
         "input": str(input_path),
         "output": str(output_path),
         "original_class_counts": original_counts,
-        "final_original_point_class_counts": final_counts,
+        "final_original_point_class_counts": final_original_counts,
         "tower_components_total": len(components),
         "tower_components_kept": len(kept_components),
         "tower_components_removed": len(components) - len(kept_components),
@@ -3086,55 +3807,39 @@ def main():
         "removed_physical_towers_without_line_touch": int(removed_no_touch_towers),
         "removed_physical_towers_without_top_line": int(removed_no_top_line_towers),
         "removed_physical_towers_with_too_few_inside_line_points": int(removed_inside_line_towers),
-        "removed_physical_towers_without_continuous_inside_line": int(
-            removed_noncontinuous_line_towers
-        ),
+        "removed_physical_towers_without_continuous_inside_line": int(removed_noncontinuous_line_towers),
         "removed_physical_towers_without_side_line": int(removed_no_side_line_towers),
         "removed_physical_towers_without_nearby_insulator": int(removed_insulatorless_towers),
-        "removed_physical_towers_without_insulator_line_bridge": int(
-            removed_unbridged_insulator_towers
-        ),
+        "removed_physical_towers_without_insulator_line_bridge": int(removed_unbridged_insulator_towers),
         "removed_bare_pole_physical_towers": int(removed_bare_pole_towers),
         "removed_physical_towers_without_connected_line_span": int(removed_unconnected_span_towers),
+        "removed_detached_tower_components": int(removed_detached_tower_components),
+        "removed_low_tower_clutter_points": int(
+            removed_low_tower_clutter_indices.size
+        ),
+        "removed_low_line_insulator_points": int(
+            low_line_insulator_stats["removed_points"]
+        ),
+        "removed_low_line_points": int(
+            low_line_insulator_stats["removed_line_points"]
+        ),
+        "removed_low_insulator_points": int(
+            low_line_insulator_stats["removed_insulator_points"]
+        ),
+        "low_line_insulator_ground_grid_count": int(
+            low_line_insulator_stats["ground_grid_count"]
+        ),
         "removed_tower_points": int(removed_indices.size),
-        "conductors": debug_conductor_reports,
-        "conductor_count": len(conductor_reports),
-        "colored_original_line_points": int(colored_line_points),
-        "appended_conductor_fit_points": int(appended_conductor_points),
+        "removed_existing_synthetic_points": int(removed_existing_synthetic_points),
         "tower_components": [json_ready_component(comp) for comp in components],
-        "boxes": [json_ready_box(box) for box in boxes],
-        "appended_box_edge_points": appended_points,
-        "obb_origin_mode": args.obb_origin,
-        "obb_origin_xyz": obb_origin.tolist(),
-        "json_box_orientation": args.json_box_orientation,
         "elapsed_sec": round(elapsed, 3),
+        "cleanup_elapsed_sec": round(cleanup_elapsed, 3),
         "parameters": vars(args),
     }
-    tower_box_report = make_standard_tower_boxes(
-        [box for box in boxes if box["kind"] == "tower"],
-        obb_origin,
-        args.json_box_orientation,
-    )
-    line_box_report = make_standard_line_boxes(
-        span_boxes, obb_origin, args.json_box_orientation
-    )
-    combined_box_report = tower_box_report + line_box_report
-    conductor_render_report = make_conductor_render_report(
-        conductor_reports, obb_origin
-    )
-
     write_json(report_path, report)
-    write_json(combined_box_report_path, combined_box_report)
-    write_json(conductor_report_path, conductor_render_report)
-    if tower_box_report_path is not None:
-        write_json(tower_box_report_path, tower_box_report)
 
-    print(f"Wrote LAS: {output_path}", flush=True)
-    print(f"Wrote report: {report_path}", flush=True)
-    if tower_box_report_path is not None:
-        print(f"Wrote tower boxes: {tower_box_report_path}", flush=True)
-    print(f"Wrote combined boxes: {combined_box_report_path}", flush=True)
-    print(f"Wrote conductors: {conductor_report_path}", flush=True)
+    print(f"Wrote cleaned LAS: {output_path}", flush=True)
+    print(f"Wrote clean report: {report_path}", flush=True)
     print(f"Finished in {elapsed:.2f}s", flush=True)
 
 
@@ -3142,65 +3847,10 @@ if __name__ == "__main__":
     main()
 
 """ 
-python tools/infer/postprocess_tower_line_boxes.py \
-  --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick.las \
-  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_output.las \
-  --report /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_report.json \
-  --tower-voxel-size 0.50 \
-  --min-tower-points 50000 \
-  --min-tower-height 30.0 \
-  --min-tower-height-above-ground 8.0 \
-  --require-line-near-tower \
-  --tower-line-radius 18.0 \
-  --min-line-points-near-tower 100 \
-  --merge-tower-xy-radius 18.0 \
-  --line-corridor-width 20.0 \
-  --span-end-margin 12.0 \
-  --min-span-line-points 500 \
-  --tower-box-margin 1.0 \
-  --line-box-margin 1.0 \
-  --edge-step 0.30 \
-  --json-box-orientation fitted \
-  --overwrite
-  
-  python tools/infer/postprocess_tower_line_boxes.py \
-  --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick.las \
-  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_v1.las \
-  --report /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_from_json_boxes_and_conductors_v10_thick_v1.json \
-  --require-insulator-line-bridge \
-  --tower-insulator-xy-margin 6.0 \
-  --tower-insulator-z-margin 6.0 \
-  --tower-insulator-min-height-ratio 0.35 \
-  --insulator-line-radius 1.2 \
-  --min-bridged-insulator-points 20 \
-  --json-box-orientation fitted \
+python tools/infer/postprocess_tower_line_clean.py \
+  --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/test_insulator_hengdan/source_tower/Stage1_tower/tower_004_杆塔4.las \
+  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/test_insulator_hengdan/source_tower/tower_004_杆塔4_clean.las \
   --overwrite
   
   
-  旧的
-  python tools/infer/postprocess_tower_line_boxes.py \
-   --input /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_plain_v1.las \
-  --output /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_plain_v1_outPut.las \
-  --report /24085403037/24085403037/shixi/dataset/6_23_demo/test/cloudb_plain_v1_report.json \
-  --min-tower-height 6.0 \
-  --min-tower-points 200 \
-  --min-tower-height-above-ground 4.0 \
-  --require-tower-top-line \
-  --tower-top-line-xy-margin 6.0 \
-  --tower-top-line-z-below 5.0 \
-  --tower-top-line-z-above 8.0 \
-  --min-tower-top-line-points 30 \
-  --merge-tower-xy-radius 10.0 \
-  --line-corridor-width 20.0 \
-  --min-span-line-points 200 \
-  --json-box-orientation fitted \
-  --overwrite
-"""
-""" 
-
-    
-    
-    
-    
-    
 """

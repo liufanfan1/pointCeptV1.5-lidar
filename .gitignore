@@ -3,3 +3,9 @@
 data/
 # 权重
 exp/
+# 部署windows
+deploy/
+# 部署linux
+deploy_linux/
+
+images/
